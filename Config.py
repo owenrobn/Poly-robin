@@ -9,6 +9,7 @@ WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 
 # Polymarket CLOB
 CLOB_API_URL = "https://clob.polymarket.com"
+POLY_API_KEY = os.getenv("POLY_API_KEY")
 CHAIN_ID = 137  # Polygon mainnet
 
 # Telegram
