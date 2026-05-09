@@ -1,5 +1,4 @@
-# Swing-Flip strategy engine
- import asyncio
+import asyncio
 import logging
 from config import (
     ENTRY_THRESHOLD, FLIP_THRESHOLD, TAKE_PROFIT,
@@ -8,24 +7,23 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+
 class SwingFlip:
     def __init__(self, market_id, pocket, clob_client, notify=None):
         self.market_id = market_id
         self.pocket = pocket
         self.clob = clob_client
-        self.notify = notify        # Telegram alert callback
-        self.position = None        # "YES", "NO", or None
+        self.notify = notify
+        self.position = None
         self.shares = 0
         self.entry_price = None
         self.in_cooldown = False
         self.trade_count = 0
 
     async def on_price_update(self, yes_price: float):
-        """Main handler — called on every WebSocket price tick."""
         if self.in_cooldown:
             logger.info(f"[{self.market_id}] Cooldown active, skipping tick.")
             return
-
         if self.position is None:
             await self._check_entry(yes_price)
         elif self.position == "YES":
@@ -33,7 +31,6 @@ class SwingFlip:
         elif self.position == "NO":
             await self._check_no_exit(yes_price)
 
-    # --- Entry Logic ---
     async def _check_entry(self, price: float):
         if price >= ENTRY_THRESHOLD:
             size = self.pocket.calculate_size(price)
@@ -42,14 +39,10 @@ class SwingFlip:
                 return
             await self._buy("YES", price, size)
 
-    # --- Exit / Flip Logic ---
     async def _check_exit_or_flip(self, price: float):
-        # Take Profit
         if price >= TAKE_PROFIT:
             await self._close_position(price, reason="Take Profit")
             return
-
-        # Flip to NO
         if price <= FLIP_THRESHOLD:
             slippage = abs(price - FLIP_THRESHOLD) / FLIP_THRESHOLD
             if slippage > SLIPPAGE_MAX:
@@ -60,13 +53,11 @@ class SwingFlip:
             await self._buy("NO", 1 - price, size)
             await self._trigger_cooldown()
 
-    # --- NO position exit ---
     async def _check_no_exit(self, price: float):
         no_price = 1 - price
         if no_price >= TAKE_PROFIT:
             await self._close_position(price, reason="NO Take Profit")
 
-    # --- Order Execution ---
     async def _buy(self, side: str, price: float, size: float):
         logger.info(f"[{self.market_id}] BUY {side} | Price: {price:.2f} | Size: {size}")
         try:
@@ -81,7 +72,9 @@ class SwingFlip:
             self.entry_price = price
             self.trade_count += 1
             if self.notify:
-                await self.notify(f"✅ Entry Executed\nSide: {side}\nPrice: {price:.2f}\nSize: {size}")
+                await self.notify(
+                    f"✅ Entry Executed\nSide: {side}\nPrice: {price:.2f}\nSize: {size}"
+                )
         except Exception as e:
             logger.error(f"[{self.market_id}] Buy failed: {e}")
 
@@ -107,7 +100,6 @@ class SwingFlip:
         if self.notify:
             await self.notify(f"🏁 Position Closed\nReason: {reason}\nPrice: {price:.2f}")
 
-    # --- Cooldown ---
     async def _trigger_cooldown(self):
         logger.info(f"[{self.market_id}] Cooldown triggered for {COOLDOWN_SECONDS}s")
         self.in_cooldown = True
@@ -117,7 +109,6 @@ class SwingFlip:
         self.in_cooldown = False
         logger.info(f"[{self.market_id}] Cooldown lifted.")
 
-    # --- State ---
     def get_state(self):
         return {
             "market_id": self.market_id,
