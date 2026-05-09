@@ -26,3 +26,4 @@ SLIPPAGE_MAX = 0.02         # 2% max slippage
 # Pocket
 MIN_POCKET_USDC = 50.0      # Minimum wallet balance to trade
 MIN_SHARES = 5              # Polymarket CLOB minimum
+POLYGONSCAN_API_KEY = os.getenv("POLYGONSCAN_API_KEY")

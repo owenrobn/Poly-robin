@@ -1,13 +1,10 @@
+import os
 import logging
 import aiohttp
-from config import (
-    CLOB_API_URL, WALLET_ADDRESS,
-    MIN_POCKET_USDC, MIN_SHARES
-)
+from config import WALLET_ADDRESS, MIN_POCKET_USDC, MIN_SHARES
 
 logger = logging.getLogger(__name__)
 
-POLYGON_RPC = "https://polygon-rpc.com"
 USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 POL_MIN_BALANCE = 0.5
 
@@ -29,9 +26,11 @@ class Pocket:
 
     async def _get_usdc_balance(self) -> float:
         url = (
-            f"{POLYGON_RPC}?module=account&action=tokenbalance"
+            f"https://api.etherscan.io/v2/api"
+            f"?chainid=137&module=account&action=tokenbalance"
             f"&contractaddress={USDC_CONTRACT}"
-            f"&address={WALLET_ADDRESS}&tag=latest"
+            f"&address={WALLET_ADDRESS}"
+            f"&tag=latest&apikey={os.getenv('POLYGONSCAN_API_KEY')}"
         )
         try:
             async with aiohttp.ClientSession() as session:
@@ -45,8 +44,10 @@ class Pocket:
 
     async def _get_pol_balance(self) -> float:
         url = (
-            f"{POLYGON_RPC}?module=account&action=balance"
-            f"&address={WALLET_ADDRESS}&tag=latest"
+            f"https://api.etherscan.io/v2/api"
+            f"?chainid=137&module=account&action=balance"
+            f"&address={WALLET_ADDRESS}"
+            f"&tag=latest&apikey={os.getenv('POLYGONSCAN_API_KEY')}"
         )
         try:
             async with aiohttp.ClientSession() as session:
