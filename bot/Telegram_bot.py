@@ -1,8 +1,9 @@
 import logging
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes
 )
 from config import TELEGRAM_TOKEN
@@ -28,30 +29,51 @@ class PolyRobinBot:
     def _register_handlers(self):
         self.app.add_handler(CommandHandler("start", self.cmd_start))
         self.app.add_handler(CommandHandler("trade", self.cmd_trade))
-        self.app.add_handler(CommandHandler("auto", self.cmd_auto))
         self.app.add_handler(CommandHandler("status", self.cmd_status))
-        self.app.add_handler(CommandHandler("kill", self.cmd_kill))
-        self.app.add_handler(CommandHandler("reset", self.cmd_reset))
+        self.app.add_handler(CallbackQueryHandler(self.handle_callback))
 
-    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def _main_keyboard(self):
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📊 Status", callback_data="status"),
+                InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
+            ],
+            [
+                InlineKeyboardButton("🔍 Auto ON", callback_data="auto_on"),
+                InlineKeyboardButton("⏹ Auto OFF", callback_data="auto_off"),
+            ],
+            [
+                InlineKeyboardButton("🚨 Kill Switch", callback_data="kill"),
+                InlineKeyboardButton("✅ Reset", callback_data="reset"),
+            ],
+            [
+                InlineKeyboardButton("💰 Claim Profits", callback_data="claim"),
+            ]
+        ])
+
+    async def cmd_start(
+        self, update: Update,
+        context: ContextTypes.DEFAULT_TYPE
+    ):
         self.chat_id = update.effective_chat.id
         await self.pocket.refresh_balances()
         summary = self.pocket.get_summary()
         await update.message.reply_text(
-            f"🤖 Poly-Robin is live!\n\n"
+            f"🤖 *Poly-Robin is live!*\n\n"
             f"💰 USDC: ${summary['usdc_balance']:.2f}\n"
             f"⛽ POL: {summary['pol_balance']:.4f}\n"
             f"🔒 Reserved: ${summary['reserved']:.2f}\n"
             f"✅ Available: ${summary['available']:.2f}\n\n"
-            f"Commands:\n"
-            f"/trade [url] [entry] [flip] — Start a trade\n"
-            f"/auto on|off — Toggle bulk scanner\n"
-            f"/status — View active trades\n"
-            f"/kill — Emergency close all\n"
-            f"/reset — Re-enable after kill"
+            f"Use the buttons below to control the bot.\n"
+            f"Or use /trade [url] [entry] [flip] to set up a trade.",
+            parse_mode="Markdown",
+            reply_markup=self._main_keyboard()
         )
 
-    async def cmd_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def cmd_trade(
+        self, update: Update,
+        context: ContextTypes.DEFAULT_TYPE
+    ):
         args = context.args
         if len(args) < 3:
             await update.message.reply_text(
@@ -83,30 +105,86 @@ class PolyRobinBot:
         await update.message.reply_text(
             f"✅ Trade set up!\n"
             f"Market: {market_id}\n"
-            f"Entry: {entry:.2f} | Flip: {flip:.2f}"
+            f"Entry: {entry:.2f} | Flip: {flip:.2f}",
+            reply_markup=self._main_keyboard()
         )
 
-    async def cmd_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        args = context.args
-        if not args or args[0].lower() not in ["on", "off"]:
-            await update.message.reply_text("Usage: /auto on|off")
-            return
-        if args[0].lower() == "on":
-            await self.ingestion.scan_all_crypto_markets()
-            await update.message.reply_text(
-                f"🔍 Auto scanner ON\n"
-                f"Markets loaded: {len(self.ingestion.get_active_markets())}"
-            )
-        else:
-            self.ingestion.stop_feed()
-            await update.message.reply_text("⏹️ Auto scanner OFF.")
+    async def cmd_status(
+        self, update: Update,
+        context: ContextTypes.DEFAULT_TYPE
+    ):
+        await self._send_status(update.message.reply_text)
 
-    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def handle_callback(
+        self, update: Update,
+        context: ContextTypes.DEFAULT_TYPE
+    ):
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+
+        if data == "status":
+            await self._send_status(query.message.reply_text)
+
+        elif data == "auto_on":
+            await self.ingestion.scan_all_crypto_markets()
+            await query.message.reply_text(
+                f"🔍 Auto scanner ON\n"
+                f"Markets loaded: {len(self.ingestion.get_active_markets())}",
+                reply_markup=self._main_keyboard()
+            )
+
+        elif data == "auto_off":
+            self.ingestion.stop_feed()
+            await query.message.reply_text(
+                "⏹ Auto scanner OFF.",
+                reply_markup=self._main_keyboard()
+            )
+
+        elif data == "kill":
+            await self.risk.kill_all()
+            await query.message.reply_text(
+                "🚨 Kill switch activated. All positions closed.",
+                reply_markup=self._main_keyboard()
+            )
+
+        elif data == "reset":
+            self.risk.reset_kill_switch()
+            await query.message.reply_text(
+                "✅ Kill switch reset. Trading re-enabled.",
+                reply_markup=self._main_keyboard()
+            )
+
+        elif data == "claim":
+            redeemed = 0
+            for market_id, swing in self.risk.active_trades.items():
+                try:
+                    await swing._redeem_profits()
+                    redeemed += 1
+                except Exception as e:
+                    logger.error(f"Claim failed for {market_id}: {e}")
+            await query.message.reply_text(
+                f"💰 Profits claimed for {redeemed} market(s).",
+                reply_markup=self._main_keyboard()
+            )
+
+        elif data == "refresh":
+            await self.pocket.refresh_balances()
+            summary = self.pocket.get_summary()
+            await query.message.reply_text(
+                f"🔄 Balance refreshed!\n\n"
+                f"💰 USDC: ${summary['usdc_balance']:.2f}\n"
+                f"⛽ POL: {summary['pol_balance']:.4f}\n"
+                f"✅ Available: ${summary['available']:.2f}",
+                reply_markup=self._main_keyboard()
+            )
+
+    async def _send_status(self, reply_fn):
         status = self.risk.get_status()
         await self.pocket.refresh_balances()
         summary = self.pocket.get_summary()
         msg = (
-            f"📊 Poly-Robin Status\n\n"
+            f"📊 *Poly-Robin Status*\n\n"
             f"💰 USDC: ${summary['usdc_balance']:.2f}\n"
             f"✅ Available: ${summary['available']:.2f}\n"
             f"📈 Active Trades: {status['active_trades']}/{status['max_trades']}\n"
@@ -115,31 +193,24 @@ class PolyRobinBot:
         for m in status["markets"]:
             state = m["state"]
             msg += (
-                f"🔹 {m['market_id']}\n"
+                f"🔹 {m['market_id'][:20]}...\n"
                 f"   Position: {state['position']}\n"
                 f"   Shares: {state['shares']}\n"
                 f"   Entry: {state['entry_price']}\n"
                 f"   Cooldown: {state['in_cooldown']}\n\n"
             )
-        await update.message.reply_text(msg)
-
-    async def cmd_kill(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self.risk.kill_all()
-        await update.message.reply_text(
-            "🚨 Kill switch activated. All positions closed."
-        )
-
-    async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.risk.reset_kill_switch()
-        await update.message.reply_text(
-            "✅ Kill switch reset. Trading re-enabled."
+        await reply_fn(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=self._main_keyboard()
         )
 
     async def send_alert(self, message: str):
         if self.chat_id:
             await self.app.bot.send_message(
                 chat_id=self.chat_id,
-                text=message
+                text=message,
+                reply_markup=self._main_keyboard()
             )
 
     async def _on_price_update(self, market_id: str, price: float):
@@ -149,4 +220,4 @@ class PolyRobinBot:
 
     def run(self):
         logger.info("Poly-Robin bot starting...")
-        self.app.run_polling()
+        self.app.run_polling(poll_interval=1.0)
