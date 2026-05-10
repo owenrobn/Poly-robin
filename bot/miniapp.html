@@ -853,6 +853,57 @@
     font-family: 'Share Tech Mono', monospace;
 }
 
+.controls-row {
+    margin: 0 16px 12px;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.control-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+}
+
+.control-item:last-child {
+    border-bottom: none;
+}
+
+.control-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 2px;
+}
+
+.control-hint {
+    font-size: 10px;
+    color: var(--muted);
+}
+
+.claim-btn {
+    background: rgba(57, 255, 110, 0.1);
+    border: 1px solid rgba(57, 255, 110, 0.3);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--green);
+    cursor: pointer;
+    font-family: 'Exo 2', sans-serif;
+    transition: all 0.2s;
+    text-shadow: 0 0 6px rgba(57, 255, 110, 0.4);
+}
+
+.claim-btn:hover {
+    background: rgba(57, 255, 110, 0.2);
+    border-color: var(--green);
+}
+
   /* TOAST */
   .toast {
     position: fixed;
@@ -1089,6 +1140,27 @@
 </div>
 
 <!-- KILL SWITCH -->
+<div class="section-divider">Controls</div>
+<div class="controls-row">
+  <div class="control-item">
+    <div class="control-label">
+      <div class="control-title">Auto Redeem</div>
+      <div class="control-hint">Auto-claim profits when position closes</div>
+    </div>
+    <label class="toggle">
+      <input type="checkbox" class="green-toggle" id="autoRedeemToggle" checked onchange="toggleAutoRedeem(this)">
+      <div class="toggle-track"></div>
+      <div class="toggle-thumb"></div>
+    </label>
+  </div>
+  <div class="control-item">
+    <div class="control-label">
+      <div class="control-title">Claim Now</div>
+      <div class="control-hint">Manually redeem all pending profits</div>
+    </div>
+    <button class="claim-btn" onclick="claimNow()">💰 Claim</button>
+  </div>
+</div>
 <div class="section-divider">Emergency</div>
 <button class="kill-btn" onclick="killAll()">⚠ Kill Switch — Close All Positions</button>
 
@@ -1366,6 +1438,17 @@ const coins = [
       document.getElementById('balanceChip').textContent = `$${data.available.toFixed(2)}`;
     } catch (e) {}
   }
+
+    function toggleAutoRedeem(el) {
+        sendToBot('/api/auto-redeem', { enabled: el.checked });
+        showToast(el.checked ? '✅ Auto redeem enabled' : '⏹ Auto redeem disabled');
+    }
+
+    async function claimNow() {
+        showToast('💰 Claiming all pending profits...');
+        const res = await sendToBot('/api/claim', {});
+        showToast('✅ Profits claimed!');
+    }
 
   function showToast(msg) {
     const t = document.getElementById('toast');

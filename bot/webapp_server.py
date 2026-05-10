@@ -136,6 +136,25 @@ async def get_submarkets(url: str):
     markets, event_title = await _ingestion.fetch_event_submarkets(url)
     return {"markets": markets, "event_title": event_title}
 
+@app.post("/api/auto-redeem")
+async def toggle_auto_redeem(data: dict):
+    enabled = data.get("enabled", True)
+    # Store setting — applied per swing instance
+    for swing in _risk.active_trades.values():
+        swing.auto_redeem = enabled
+    return {"status": "ok", "auto_redeem": enabled}
+
+@app.post("/api/claim")
+async def claim_all():
+    redeemed = 0
+    for market_id, swing in _risk.active_trades.items():
+        try:
+            await swing._redeem_profits()
+            redeemed += 1
+        except Exception as e:
+            logger.error(f"Claim failed for {market_id}: {e}")
+    return {"status": "ok", "redeemed": redeemed}
+
 
 @app.get("/api/debug-url")
 async def debug_url(url: str):
