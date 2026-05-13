@@ -3,13 +3,13 @@ import json
 import logging
 import websockets
 import aiohttp
+import os
 from config import CLOB_API_URL
 
 logger = logging.getLogger(__name__)
 
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-# Coin slug mapping for Up/Down markets
 COIN_SLUGS = {
     "btc":  "btc-updown",
     "eth":  "eth-updown",
@@ -22,22 +22,26 @@ COIN_SLUGS = {
 
 VALID_TIMEFRAMES = ["5m", "15m", "1h", "4h"]
 
+BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://polymarket.com/',
+    'Origin': 'https://polymarket.com',
+    'POLY-API-KEY': os.getenv('POLY_API_KEY', '')
+}
+
 
 class MarketIngestion:
     def __init__(self, on_price_update):
         self.on_price_update = on_price_update
-        self.active_markets = {}        # market_id: token_id
-        self.market_metadata = {}       # market_id: { coin, timeframe, slug }
+        self.active_markets = {}
+        self.market_metadata = {}
         self.running = False
 
-    # --- Dynamic Slug Resolution ---
     async def resolve_active_contract(self, coin: str, timeframe: str):
-        """
-        Find the latest active Up/Down contract for a coin+timeframe.
-        Searches CLOB API for active markets matching the slug pattern.
-        """
         if timeframe not in VALID_TIMEFRAMES:
-            logger.warning(f"Invalid timeframe: {timeframe}. Use {VALID_TIMEFRAMES}")
+            logger.warning(f"Invalid timeframe: {timeframe}")
             return None, None
 
         base_slug = COIN_SLUGS.get(coin.lower())
@@ -50,56 +54,44 @@ class MarketIngestion:
 
         try:
             async with aiohttp.ClientSession() as session:
-                # Search by slug keyword
-                url = f"{CLOB_API_URL}/markets?slug={search_slug}&active=true"
-                async with session.get(url) as resp:
+                gamma_url = f"https://gamma-api.polymarket.com/markets?slug={search_slug}&active=true&limit=20"
+                async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        markets = data if isinstance(data, list) else data.get("data", [])
+                        markets = await resp.json()
+                        if not isinstance(markets, list):
+                            markets = markets.get("data", [])
 
-                        if not markets:
-                            # Fallback: search all active markets
-                            url2 = f"{CLOB_API_URL}/markets?active=true&limit=100"
-                            async with session.get(url2) as resp2:
-                                if resp2.status == 200:
-                                    all_data = await resp2.json()
-                                    all_markets = all_data if isinstance(all_data, list) else all_data.get("data", [])
-                                    markets = [
-                                        m for m in all_markets
-                                        if search_slug in m.get("market_slug", "").lower()
-                                        or search_slug in m.get("question", "").lower()
-                                    ]
+                        markets = [
+                            m for m in markets
+                            if search_slug in m.get("slug", "").lower()
+                        ]
 
                         if not markets:
                             logger.warning(f"No active market found for {search_slug}")
                             return None, None
 
-                        # Pick most recent active market
-                        market = sorted(
-                                markets,
-                                key=lambda m: m.get("end_date_iso") or "",
-                                reverse=True
-                            )[0]
-
-                        slug = market.get("condition_id") or market.get("market_slug")
-                        tokens = market.get("tokens", [])
-                        token_id = next(
-                            (t.get("token_id") for t in tokens if t.get("outcome") == "Yes"),
-                            None
+                        markets = sorted(
+                            markets,
+                            key=lambda m: m.get("endDate") or m.get("end_date_iso") or "",
+                            reverse=True
                         )
+                        market = markets[0]
 
-                        if token_id:
-                            logger.info(f"Resolved {search_slug} → {slug}")
-                            return slug, token_id
+                        condition_id = market.get("conditionId") or market.get("condition_id")
+                        clob_token_ids = market.get("clobTokenIds", [])
+                        token_id = clob_token_ids[0] if clob_token_ids else None
+                        question = market.get("question", search_slug)
+
+                        if condition_id and token_id:
+                            logger.info(f"Resolved: {question} → {condition_id}")
+                            return condition_id, token_id
 
         except Exception as e:
             logger.error(f"Contract resolution failed for {search_slug}: {e}")
 
         return None, None
 
-    # --- Coin Toggle (from Mini App) ---
     async def add_coin_market(self, coin: str, timeframe: str):
-        """Add a coin+timeframe market from the dashboard toggle."""
         market_id, token_id = await self.resolve_active_contract(coin, timeframe)
         if market_id and token_id:
             self.active_markets[market_id] = token_id
@@ -112,7 +104,6 @@ class MarketIngestion:
         return None, None
 
     def remove_coin_market(self, coin: str, timeframe: str):
-        """Remove a coin+timeframe market when toggled off."""
         to_remove = [
             mid for mid, meta in self.market_metadata.items()
             if meta.get("coin") == coin and meta.get("timeframe") == timeframe
@@ -122,7 +113,6 @@ class MarketIngestion:
             self.market_metadata.pop(mid, None)
             logger.info(f"Removed {coin.upper()} {timeframe} market.")
 
-    # --- URL Parser (for manual markets) ---
     async def add_market_from_url(self, url: str):
         try:
             slug = url.rstrip("/").split("/event/")[1].split("/")[0].split("#")[0] if "/event/" in url else url.rstrip("/").split("/")[-1].split("#")[0]
@@ -139,42 +129,47 @@ class MarketIngestion:
             return None, None
 
     async def _resolve_token_id(self, slug: str):
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json'
-        }
-        url = f"https://clob.polymarket.com/markets/{slug}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    tokens = data.get("tokens", [])
-                    for token in tokens:
-                        if token.get("outcome") == "Yes":
-                            return token.get("token_id")
-                else:
-                    logger.error(f"API error {resp.status} for slug: {slug}")
+        clob_url = f"{CLOB_API_URL}/markets/{slug}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(clob_url, headers=BROWSER_HEADERS) as resp:
+                    logger.info(f"CLOB API [{resp.status}] for slug: {slug}")
+                    if resp.status == 200:
+                        data = await resp.json()
+                        tokens = data.get("tokens", [])
+                        for token in tokens:
+                            if token.get("outcome") == "Yes":
+                                return token.get("token_id")
+                    else:
+                        raw = await resp.text()
+                        logger.error(f"CLOB error {resp.status}: {raw[:200]}")
+        except Exception as e:
+            logger.error(f"CLOB request failed: {e}")
+
+        gamma_url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        markets = data if isinstance(data, list) else data.get("data", [])
+                        if markets:
+                            clob_ids = markets[0].get("clobTokenIds", [])
+                            if clob_ids:
+                                return clob_ids[0]
+        except Exception as e:
+            logger.error(f"Gamma fallback failed: {e}")
+
         return None
-        
+
     async def fetch_event_submarkets(self, url: str):
-        """
-        Fetch all sub-markets from a Polymarket event URL using Gamma API.
-        """
         try:
             slug = url.rstrip("/").split("/event/")[1].split("/")[0].split("#")[0] if "/event/" in url else url.rstrip("/").split("/")[-1].split("#")[0]
             logger.info(f"Fetching sub-markets for slug: {slug}")
 
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'application/json',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': 'https://polymarket.com/',
-                'Origin': 'https://polymarket.com'
-            }
-
             async with aiohttp.ClientSession() as session:
                 gamma_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
-                async with session.get(gamma_url, headers=headers) as resp:
+                async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
                     logger.info(f"Gamma API status: {resp.status} for slug: {slug}")
                     raw = await resp.text()
                     logger.info(f"Gamma response preview: {raw[:300]}")
@@ -182,7 +177,6 @@ class MarketIngestion:
                     if resp.status == 200:
                         data = json.loads(raw)
                         if not data:
-                            logger.warning(f"Empty response for slug: {slug}")
                             return [], None
 
                         event = data[0]
@@ -211,7 +205,6 @@ class MarketIngestion:
                         result.sort(key=lambda x: x["liquidity"], reverse=True)
                         logger.info(f"Returning {len(result)} sub-markets")
                         return result, event_title
-
                     else:
                         logger.error(f"Gamma API error {resp.status}: {raw[:200]}")
 
@@ -220,30 +213,7 @@ class MarketIngestion:
 
         return [], None
 
-    async def _resolve_token_id(self, slug: str):
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://polymarket.com/',
-            'Origin': 'https://polymarket.com'
-        }
-        url = f"https://clob.polymarket.com/markets/{slug}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    tokens = data.get("tokens", [])
-                    for token in tokens:
-                        if token.get("outcome") == "Yes":
-                            return token.get("token_id")
-                else:
-                    logger.error(f"API error {resp.status} for slug: {slug}")
-        return None
-
-    # --- Bulk Scanner ---
     async def scan_all_crypto_markets(self):
-        """Scan all active Up/Down markets for all coins and valid timeframes."""
         logger.info("Scanning all crypto Up/Down markets...")
         tasks = []
         for coin in COIN_SLUGS:
@@ -253,9 +223,7 @@ class MarketIngestion:
         loaded = sum(1 for r in results if r and r[0] is not None)
         logger.info(f"Bulk scan complete. Loaded {loaded} markets.")
 
-    # --- WebSocket Feed ---
     async def start_feed(self):
-        """Open WebSocket and stream price updates for all active markets."""
         self.running = True
         while self.running:
             token_ids = list(self.active_markets.values())

@@ -1,112 +1,73 @@
 import os
 import logging
 import aiohttp
-from config import WALLET_ADDRESS, MIN_POCKET_USDC, MIN_SHARES
 
 logger = logging.getLogger(__name__)
 
-USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-POL_MIN_BALANCE = 0.5
-
+CLOB_API_URL = "https://clob.polymarket.com"
 
 class Pocket:
     def __init__(self):
         self.usdc_balance = 0.0
-        self.pol_balance = 0.0
         self.reserved = 0.0
+        self.api_key = os.getenv("POLY_API_KEY", "")
 
     async def refresh_balances(self):
-        self.usdc_balance = await self._get_usdc_balance()
-        self.pol_balance = await self._get_pol_balance()
-        logger.info(
-            f"Balances refreshed — "
-            f"USDC: {self.usdc_balance:.2f} | "
-            f"POL: {self.pol_balance:.4f}"
-        )
+        self.usdc_balance = await self._get_polymarket_balance()
+        logger.info(f"Polymarket balance: ${self.usdc_balance:.2f}")
 
-    async def _get_usdc_balance(self) -> float:
-        url = (
-            f"https://api.etherscan.io/v2/api"
-            f"?chainid=137&module=account&action=tokenbalance"
-            f"&contractaddress={USDC_CONTRACT}"
-            f"&address={WALLET_ADDRESS}"
-            f"&tag=latest&apikey={os.getenv('POLYGONSCAN_API_KEY')}"
-        )
+    async def _get_polymarket_balance(self) -> float:
+        headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': 'application/json',
+            'POLY-API-KEY': self.api_key
+        }
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    data = await resp.json()
-                    raw = int(data.get("result", 0))
-                    return raw / 1_000_000
+                async with session.get(
+                    f"{CLOB_API_URL}/balance",
+                    headers=headers
+                ) as resp:
+                    logger.info(f"Balance API status: {resp.status}")
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return float(data.get("balance", 0))
+                    else:
+                        raw = await resp.text()
+                        logger.error(f"Balance error {resp.status}: {raw[:200]}")
         except Exception as e:
-            logger.error(f"USDC balance fetch failed: {e}")
-            return 0.0
-
-    async def _get_pol_balance(self) -> float:
-        url = (
-            f"https://api.etherscan.io/v2/api"
-            f"?chainid=137&module=account&action=balance"
-            f"&address={WALLET_ADDRESS}"
-            f"&tag=latest&apikey={os.getenv('POLYGONSCAN_API_KEY')}"
-        )
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    data = await resp.json()
-                    raw = int(data.get("result", 0))
-                    return raw / 1e18
-        except Exception as e:
-            logger.error(f"POL balance fetch failed: {e}")
-            return 0.0
+            logger.error(f"Balance fetch failed: {e}")
+        return 0.0
 
     def is_ready(self) -> bool:
         available = self.usdc_balance - self.reserved
-        if available < MIN_POCKET_USDC:
-            logger.warning(
-                f"Insufficient USDC: {available:.2f} "
-                f"(min {MIN_POCKET_USDC})"
-            )
-            return False
-        if self.pol_balance < POL_MIN_BALANCE:
-            logger.warning(
-                f"Low POL for gas: {self.pol_balance:.4f} "
-                f"(min {POL_MIN_BALANCE})"
-            )
+        if available < 1.0:
+            logger.warning(f"Insufficient balance: ${available:.2f}")
             return False
         return True
 
-    def calculate_size(self, price: float, fraction: float = 0.2) -> float:
-        available = self.usdc_balance - self.reserved
-        usdc_to_spend = available * fraction
+    def calculate_size(self, price: float, shares: int = 10) -> float:
+        """Use fixed shares instead of percentage sizing."""
         if price <= 0:
             return 0.0
-        size = usdc_to_spend / price
-        size = round(size, 2)
-        if size < MIN_SHARES:
-            logger.warning(
-                f"Calculated size {size} below minimum {MIN_SHARES}."
-            )
+        from config import MIN_SHARES
+        if shares < MIN_SHARES:
+            logger.warning(f"Shares {shares} below minimum {MIN_SHARES}")
             return 0.0
-        return size
+        return float(shares)
 
     def reserve(self, amount: float):
         self.reserved += amount
-        logger.info(
-            f"Reserved {amount:.2f} USDC. "
-            f"Total reserved: {self.reserved:.2f}"
-        )
+        logger.info(f"Reserved ${amount:.2f}. Total: ${self.reserved:.2f}")
 
     def release(self, amount: float):
         self.reserved = max(0.0, self.reserved - amount)
-        logger.info(
-            f"Released {amount:.2f} USDC. "
-            f"Total reserved: {self.reserved:.2f}"
-        )
+        logger.info(f"Released ${amount:.2f}. Total: ${self.reserved:.2f}")
 
     def get_summary(self) -> dict:
         return {
             "usdc_balance": self.usdc_balance,
-            "pol_balance": self.pol_balance,
+            "pol_balance": 0.0,
             "reserved": self.reserved,
             "available": self.usdc_balance - self.reserved
         }

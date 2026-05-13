@@ -15,28 +15,26 @@ class SwingFlip:
         self.clob = clob_client
         self.notify = notify
 
-        # Position state
-        self.position = None        # "YES", "NO", or None
+        self.position = None
         self.shares = 0
         self.entry_price = None
         self.in_cooldown = False
         self.trade_count = 0
+        self.auto_redeem = True
 
-        # Parameters (can be overridden per market)
-        self.entry_threshold = ENTRY_THRESHOLD      # 0.70
-        self.flip_threshold = FLIP_THRESHOLD        # 0.60
-        self.take_profit = TAKE_PROFIT              # 0.95
-        self.stop_loss = 0.45                       # Default stop loss
-        self.buy_buffer = 0.02                      # Default spread buffer (2¢)
+        self.entry_threshold = ENTRY_THRESHOLD
+        self.flip_threshold = FLIP_THRESHOLD
+        self.take_profit = TAKE_PROFIT
+        self.stop_loss = 0.45
+        self.buy_buffer = 0.02
+        self.num_shares = MIN_SHARES
         self.cooldown_seconds = COOLDOWN_SECONDS
 
-        # Direction tracking
-        self.entry_direction = None     # "YES" or "NO" — whichever hit first
+        self.entry_direction = None
         self.last_yes_price = None
         self.last_no_price = None
 
     async def on_price_update(self, yes_price: float):
-        """Main handler — called on every WebSocket price tick."""
         no_price = round(1 - yes_price, 4)
         self.last_yes_price = yes_price
         self.last_no_price = no_price
@@ -52,113 +50,80 @@ class SwingFlip:
         elif self.position == "NO":
             await self._manage_no_position(no_price)
 
-    # --- Entry Logic (direction-agnostic) ---
     async def _check_entry(self, yes_price: float, no_price: float):
-        """
-        Enter whichever side hits the entry threshold first.
-        YES hits 70c → buy YES.
-        NO hits 70c (YES at 30c) → buy NO.
-        """
-        effective_entry_yes = self.entry_threshold + self.buy_buffer
-        effective_entry_no = self.entry_threshold + self.buy_buffer
-
         if yes_price >= self.entry_threshold:
             buy_price = min(yes_price + self.buy_buffer, 0.99)
-            size = self.pocket.calculate_size(buy_price)
+            size = self.pocket.calculate_size(buy_price, self.num_shares)
             if size >= MIN_SHARES:
                 self.entry_direction = "YES"
                 await self._buy("YES", buy_price, size)
-
         elif no_price >= self.entry_threshold:
             buy_price = min(no_price + self.buy_buffer, 0.99)
-            size = self.pocket.calculate_size(buy_price)
+            size = self.pocket.calculate_size(buy_price, self.num_shares)
             if size >= MIN_SHARES:
                 self.entry_direction = "NO"
                 await self._buy("NO", buy_price, size)
 
-    # --- YES Position Management ---
     async def _manage_yes_position(self, yes_price: float):
-        # Take Profit
         if yes_price >= self.take_profit:
             await self._close_position(yes_price, reason="Take Profit")
-            await self._redeem_profits()
+            if self.auto_redeem:
+                await self._redeem_profits()
             return
-
-        # Stop Loss — exit before swing
         if yes_price <= self.stop_loss:
             await self._close_position(yes_price, reason="Stop Loss")
-            await self._redeem_profits()
+            if self.auto_redeem:
+                await self._redeem_profits()
             return
-
-        # Swing — only on confirmed price reversal
         if yes_price <= self.flip_threshold:
             slippage = abs(yes_price - self.flip_threshold) / self.flip_threshold
             if slippage > SLIPPAGE_MAX:
-                logger.warning(
-                    f"[{self.market_id}] Slippage {slippage:.2%} too high. Skipping flip."
-                )
+                logger.warning(f"[{self.market_id}] Slippage too high. Skipping flip.")
                 return
-            logger.info(f"[{self.market_id}] Price reversal detected. Flipping YES → NO.")
             await self._sell("YES", yes_price)
             no_price = round(1 - yes_price, 4)
             buy_price = min(no_price + self.buy_buffer, 0.99)
-            size = self.pocket.calculate_size(buy_price)
+            size = self.pocket.calculate_size(buy_price, self.num_shares)
             if size >= MIN_SHARES:
                 await self._buy("NO", buy_price, size)
             await self._trigger_cooldown()
 
-    # --- NO Position Management ---
     async def _manage_no_position(self, no_price: float):
         yes_price = round(1 - no_price, 4)
-
-        # Take Profit on NO
         if no_price >= self.take_profit:
             await self._close_position(yes_price, reason="NO Take Profit")
-            await self._redeem_profits()
+            if self.auto_redeem:
+                await self._redeem_profits()
             return
-
-        # Stop Loss on NO
         if no_price <= self.stop_loss:
             await self._close_position(yes_price, reason="NO Stop Loss")
-            await self._redeem_profits()
+            if self.auto_redeem:
+                await self._redeem_profits()
             return
-
-        # Swing — confirmed reversal from NO back to YES
         if no_price <= self.flip_threshold:
             slippage = abs(no_price - self.flip_threshold) / self.flip_threshold
             if slippage > SLIPPAGE_MAX:
-                logger.warning(
-                    f"[{self.market_id}] Slippage {slippage:.2%} too high. Skipping flip."
-                )
+                logger.warning(f"[{self.market_id}] Slippage too high. Skipping flip.")
                 return
-            logger.info(f"[{self.market_id}] Price reversal detected. Flipping NO → YES.")
             await self._sell("NO", no_price)
             buy_price = min(yes_price + self.buy_buffer, 0.99)
-            size = self.pocket.calculate_size(buy_price)
+            size = self.pocket.calculate_size(buy_price, self.num_shares)
             if size >= MIN_SHARES:
                 await self._buy("YES", buy_price, size)
             await self._trigger_cooldown()
 
-    # --- Profit Redemption ---
     async def _redeem_profits(self):
-        """Auto-redeem profits after a position closes."""
         try:
             if self.clob:
                 logger.info(f"[{self.market_id}] Redeeming profits...")
                 await self.clob.redeem_positions(market_id=self.market_id)
                 if self.notify:
-                    await self.notify(
-                        f"💰 Profits Redeemed\nMarket: {self.market_id}"
-                    )
+                    await self.notify(f"💰 Profits Redeemed\nMarket: {self.market_id}")
         except Exception as e:
-            logger.error(f"[{self.market_id}] Profit redemption failed: {e}")
+            logger.error(f"[{self.market_id}] Redemption failed: {e}")
 
-    # --- Order Execution ---
     async def _buy(self, side: str, price: float, size: float):
-        logger.info(
-            f"[{self.market_id}] BUY {side} | "
-            f"Price: {price:.2f} | Size: {size}"
-        )
+        logger.info(f"[{self.market_id}] BUY {side} | Price: {price:.2f} | Size: {size}")
         try:
             if self.clob:
                 await self.clob.place_limit_order(
@@ -183,10 +148,7 @@ class SwingFlip:
             logger.error(f"[{self.market_id}] Buy failed: {e}")
 
     async def _sell(self, side: str, price: float):
-        logger.info(
-            f"[{self.market_id}] SELL {side} | "
-            f"Price: {price:.2f} | Size: {self.shares}"
-        )
+        logger.info(f"[{self.market_id}] SELL {side} | Price: {price:.2f} | Size: {self.shares}")
         try:
             if self.clob:
                 await self.clob.place_limit_order(
@@ -215,9 +177,7 @@ class SwingFlip:
     async def _trigger_cooldown(self):
         self.in_cooldown = True
         if self.notify:
-            await self.notify(
-                f"🔄 Position Flipped\nMarket: {self.market_id}"
-            )
+            await self.notify(f"🔄 Position Flipped\nMarket: {self.market_id}")
         await asyncio.sleep(self.cooldown_seconds)
         self.in_cooldown = False
         logger.info(f"[{self.market_id}] Cooldown lifted.")
@@ -233,6 +193,7 @@ class SwingFlip:
             "trade_count": self.trade_count,
             "stop_loss": self.stop_loss,
             "buy_buffer": self.buy_buffer,
+            "num_shares": self.num_shares,
             "last_yes_price": self.last_yes_price,
             "last_no_price": self.last_no_price,
         }

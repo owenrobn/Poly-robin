@@ -61,7 +61,6 @@ class PolyRobinBot:
         await update.message.reply_text(
             f"🤖 *Poly-Robin is live!*\n\n"
             f"💰 USDC: ${summary['usdc_balance']:.2f}\n"
-            f"⛽ POL: {summary['pol_balance']:.4f}\n"
             f"🔒 Reserved: ${summary['reserved']:.2f}\n"
             f"✅ Available: ${summary['available']:.2f}\n\n"
             f"Use the buttons below to control the bot.\n"
@@ -172,10 +171,11 @@ class PolyRobinBot:
             await self.pocket.refresh_balances()
             summary = self.pocket.get_summary()
             await query.message.reply_text(
-                f"🔄 Balance refreshed!\n\n"
+                f"🔄 *Balance Refreshed!*\n\n"
                 f"💰 USDC: ${summary['usdc_balance']:.2f}\n"
-                f"⛽ POL: {summary['pol_balance']:.4f}\n"
+                f"🔒 Reserved: ${summary['reserved']:.2f}\n"
                 f"✅ Available: ${summary['available']:.2f}",
+                parse_mode="Markdown",
                 reply_markup=self._main_keyboard()
             )
 
