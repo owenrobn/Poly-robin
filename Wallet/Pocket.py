@@ -1,43 +1,57 @@
 import os
 import logging
-import aiohttp
+from py_clob_client.client import ClobClient
 
 logger = logging.getLogger(__name__)
 
-CLOB_API_URL = "https://clob.polymarket.com"
+HOST = "https://clob.polymarket.com"
+CHAIN_ID = 137
+
 
 class Pocket:
     def __init__(self):
         self.usdc_balance = 0.0
         self.reserved = 0.0
-        self.api_key = os.getenv("POLY_API_KEY", "")
+        self.client = None
+        self._init_client()
+
+    def _init_client(self):
+        try:
+            private_key = os.getenv("PRIVATE_KEY")
+            proxy_wallet = os.getenv("PROXY_WALLET")
+            if not private_key:
+                logger.error("PRIVATE_KEY not set in .env")
+                return
+            self.client = ClobClient(
+                HOST,
+                key=private_key,
+                chain_id=CHAIN_ID,
+                signature_type=1,
+                funder=proxy_wallet
+            )
+            self.client.set_api_creds(self.client.create_or_derive_api_creds())
+            logger.info("Polymarket CLOB client initialized successfully")
+        except Exception as e:
+            logger.error(f"CLOB client init failed: {e}")
 
     async def refresh_balances(self):
-        self.usdc_balance = await self._get_polymarket_balance()
+        self.usdc_balance = await self._get_balance()
         logger.info(f"Polymarket balance: ${self.usdc_balance:.2f}")
 
-    async def _get_polymarket_balance(self) -> float:
-        headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Accept': 'application/json',
-            'POLY-API-KEY': self.api_key
-        }
+    async def _get_balance(self) -> float:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{CLOB_API_URL}/balance",
-                    headers=headers
-                ) as resp:
-                    logger.info(f"Balance API status: {resp.status}")
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return float(data.get("balance", 0))
-                    else:
-                        raw = await resp.text()
-                        logger.error(f"Balance error {resp.status}: {raw[:200]}")
+            if not self.client:
+                return 0.0
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self.client.get_balance_allowance(params=params)
+            raw = int(result.get("balance", 0))
+            balance = raw / 1_000_000
+            logger.info(f"Raw balance: {raw} → ${balance:.4f}")
+            return balance
         except Exception as e:
             logger.error(f"Balance fetch failed: {e}")
-        return 0.0
+            return 0.0
 
     def is_ready(self) -> bool:
         available = self.usdc_balance - self.reserved
@@ -47,12 +61,8 @@ class Pocket:
         return True
 
     def calculate_size(self, price: float, shares: int = 10) -> float:
-        """Use fixed shares instead of percentage sizing."""
-        if price <= 0:
-            return 0.0
         from config import MIN_SHARES
         if shares < MIN_SHARES:
-            logger.warning(f"Shares {shares} below minimum {MIN_SHARES}")
             return 0.0
         return float(shares)
 

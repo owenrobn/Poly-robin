@@ -2,6 +2,7 @@ from ..clob_types import ApiCreds, RequestArgs
 from ..signing.hmac import build_hmac_signature
 from ..signer import Signer
 from ..signing.eip712 import sign_clob_auth_message
+
 from datetime import datetime
 
 POLY_ADDRESS = "POLY_ADDRESS"
@@ -34,17 +35,22 @@ def create_level_1_headers(signer: Signer, nonce: int = None):
 
 
 def create_level_2_headers(signer: Signer, creds: ApiCreds, request_args: RequestArgs):
-    """
-    Creates Level 2 Poly headers for a request
-    """
+    """Creates Level 2 Poly headers for a request using pre-serialized body if provided"""
     timestamp = int(datetime.now().timestamp())
+
+    # Prefer the pre-serialized body string for deterministic signing if available
+    body_for_sig = (
+        request_args.serialized_body
+        if request_args.serialized_body is not None
+        else request_args.body
+    )
 
     hmac_sig = build_hmac_signature(
         creds.api_secret,
         timestamp,
         request_args.method,
         request_args.request_path,
-        request_args.body,
+        body_for_sig,
     )
 
     return {
@@ -54,3 +60,9 @@ def create_level_2_headers(signer: Signer, creds: ApiCreds, request_args: Reques
         POLY_API_KEY: creds.api_key,
         POLY_PASSPHRASE: creds.api_passphrase,
     }
+
+
+def enrich_l2_headers_with_builder_headers(
+    headers: dict, builder_headers: dict
+) -> dict:
+    return {**headers, **builder_headers}

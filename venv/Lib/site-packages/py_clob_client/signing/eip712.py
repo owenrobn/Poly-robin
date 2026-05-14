@@ -1,7 +1,9 @@
-from eip712_structs import make_domain
+from poly_eip712_structs import make_domain
+from eth_utils import keccak
+from py_order_utils.utils import prepend_zx
+
 from .model import ClobAuth
 from ..signer import Signer
-from web3 import Web3
 
 CLOB_DOMAIN_NAME = "ClobAuthDomain"
 CLOB_VERSION = "1"
@@ -20,7 +22,7 @@ def sign_clob_auth_message(signer: Signer, timestamp: int, nonce: int) -> str:
         message=MSG_TO_SIGN,
     )
     chain_id = signer.get_chain_id()
-    auth_struct_hash = Web3.keccak(
-        clob_auth_msg.signable_bytes(get_clob_auth_domain(chain_id))
+    auth_struct_hash = prepend_zx(
+        keccak(clob_auth_msg.signable_bytes(get_clob_auth_domain(chain_id))).hex()
     )
-    return signer.sign(auth_struct_hash)
+    return prepend_zx(signer.sign(auth_struct_hash))

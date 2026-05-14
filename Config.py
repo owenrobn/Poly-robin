@@ -3,9 +3,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Polymarket API
+# Polymarket
 CLOB_API_URL = "https://clob.polymarket.com"
-POLY_API_KEY = os.getenv("POLY_API_KEY")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 
 # Telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
