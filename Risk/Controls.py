@@ -45,6 +45,9 @@ class RiskControls:
                 f"Active: {len(self.active_trades)}/{MAX_ACTIVE_TRADES}"
             )
 
+    async def close_trade_async(self, market_id: str):
+        self.close_trade(market_id)
+
     async def kill_all(self):
         self.killed = True
         logger.critical("KILL SWITCH ACTIVATED — closing all positions.")

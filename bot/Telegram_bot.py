@@ -22,9 +22,11 @@ class PolyRobinBot:
         self.ingestion = MarketIngestion(
             on_price_update=self._on_price_update
         )
+        self.ingestion.set_client(self.pocket.get_client())
         self.app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
         self.chat_id = None
         self._register_handlers()
+        
 
     def _register_handlers(self):
         self.app.add_handler(CommandHandler("start", self.cmd_start))
@@ -92,11 +94,19 @@ class PolyRobinBot:
                 "⚠️ Trade blocked by risk controls."
             )
             return
+            
+        meta = self.ingestion.market_metadata.get(market_id, {})
+        tick_size = meta.get("tick_size", 0.01)
+        tokens = self.ingestion.active_markets.get(market_id, {})
+        
         swing = SwingFlip(
             market_id=market_id,
+            tokens=tokens,
             pocket=self.pocket,
-            clob_client=None,
-            notify=self.send_alert
+            notify=self.send_alert,
+            on_done=self.risk.close_trade_async,
+            tick_size=tick_size,
+            neg_risk=meta.get("neg_risk", False)
         )
         swing.entry_threshold = entry
         swing.flip_threshold = flip
@@ -216,6 +226,33 @@ class PolyRobinBot:
     async def _on_price_update(self, market_id: str, price: float):
         if market_id in self.risk.active_trades:
             swing = self.risk.active_trades[market_id]
+            await swing.on_price_update(price)
+        elif market_id in self.ingestion.active_markets:
+            # Guard against race condition: only register if still not active
+            if not self.risk.can_open_trade(market_id):
+                return
+            # Re-check after can_open_trade to prevent double registration
+            if market_id in self.risk.active_trades:
+                return
+            tokens = self.ingestion.active_markets[market_id]
+            meta = self.ingestion.market_metadata.get(market_id, {})
+            tick_size = meta.get("tick_size", 0.01)
+            await self.pocket.refresh_balances()
+            swing = SwingFlip(
+                market_id=market_id,
+                tokens=tokens,
+                pocket=self.pocket,
+                notify=self.send_alert,
+                on_done=self.risk.close_trade_async,
+                tick_size=tick_size,
+                neg_risk=meta.get("neg_risk", False)
+            )
+            # Apply default thresholds from config
+            from config import ENTRY_THRESHOLD, FLIP_THRESHOLD
+            swing.entry_threshold = float(ENTRY_THRESHOLD)
+            swing.flip_threshold = float(FLIP_THRESHOLD)
+            
+            self.risk.register_trade(market_id, swing)
             await swing.on_price_update(price)
 
     def run(self):

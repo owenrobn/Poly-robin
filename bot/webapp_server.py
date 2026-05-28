@@ -99,11 +99,17 @@ async def start_trade(data: dict):
         return {"error": "Could not resolve market"}
     if not _risk.can_open_trade(market_id):
         return {"error": "Trade blocked by risk controls"}
+    tokens = _ingestion.active_markets.get(market_id, {})
+    meta = _ingestion.market_metadata.get(market_id, {})
+    tick_size = meta.get("tick_size", 0.01)
     swing = SwingFlip(
         market_id=market_id,
+        tokens=tokens,
         pocket=_pocket,
-        clob_client=None,
-        notify=None
+        clob_client=_pocket.get_client(),
+        notify=None,
+        tick_size=tick_size,
+        neg_risk=meta.get("neg_risk", False)
     )
     swing.entry_threshold = data.get("entry", 70) / 100
     swing.flip_threshold = data.get("flip", 60) / 100

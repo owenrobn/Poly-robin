@@ -37,115 +37,260 @@ class MarketIngestion:
         self.active_markets = {}
         self.market_metadata = {}
         self.running = False
+        self.clob_client = None
+        self._polling = set()  
+
+    def set_client(self, client):
+        self.clob_client = client
 
     async def resolve_active_contract(self, coin: str, timeframe: str):
-        if timeframe not in VALID_TIMEFRAMES:
-            logger.warning(f"Invalid timeframe: {timeframe}")
-            return None, None
-
-        base_slug = COIN_SLUGS.get(coin.lower())
-        if not base_slug:
-            logger.warning(f"Unknown coin: {coin}")
-            return None, None
-
-        search_slug = f"{base_slug}-{timeframe}"
-        logger.info(f"Searching for active contract: {search_slug}")
-
+        coin_names = {
+            "btc": "Bitcoin", "eth": "Ethereum", "sol": "Solana",
+            "xrp": "XRP", "doge": "Dogecoin", "bnb": "BNB", "hype": "Hype"
+        }
+        name = coin_names.get(coin.lower(), coin.upper())
+        
+        # Determine current UTC time and match 5m interval for slug matching
+        import time
+        now = int(time.time())
+        window_ts = now - (now % 300) 
+        
+        # Try deterministic slug first (most reliable for up/down)
+        deterministic_slug = f"{coin.lower()}-updown-5m-{window_ts}"
+        logger.info(f"Trying deterministic slug: {deterministic_slug}")
+        
+        tokens, tick_size = await self._resolve_token_id_with_tick(deterministic_slug)
+        if tokens:
+            return deterministic_slug, tokens, tick_size, False
+        
+        # Fallback to search
+        search_query = f"{name} Up or Down"
+        logger.info(f"Searching for active {name} via Gamma Query...")
+        
         try:
             async with aiohttp.ClientSession() as session:
-                gamma_url = f"https://gamma-api.polymarket.com/markets?slug={search_slug}&active=true&limit=20"
-                async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
+                query_url = f"https://gamma-api.polymarket.com/markets?query={search_query}&active=true&closed=false&limit=10"
+                async with session.get(query_url, headers=BROWSER_HEADERS) as resp:
                     if resp.status == 200:
                         markets = await resp.json()
-                        if not isinstance(markets, list):
-                            markets = markets.get("data", [])
+                        clob_markets = [m for m in markets if m.get("enableOrderBook") and m.get("clobTokenIds")]
+                        
+                        if clob_markets:
+                            # Prioritize timeframe match
+                            valid = [
+                                m for m in clob_markets
+                                if timeframe.lower() in (m.get("question", "").lower() + m.get("slug", "").lower())
+                                or "5-minute" in m.get("question", "").lower()
+                            ]
+                            
+                            if not valid:
+                                valid = clob_markets
+                            
+                            valid.sort(key=lambda x: x.get("endDate") or "")
+                            market = valid[0]
+                            
+                            condition_id = market.get("conditionId")
+                            tick_size = float(market.get("minimumTickSize") or market.get("tickSize") or 0.01)
+                            neg_risk = market.get("negRisk", False)
+                            
+                            clob_ids = market.get("clobTokenIds", [])
+                            if isinstance(clob_ids, str):
+                                clob_ids = json.loads(clob_ids)
+                            
+                            yes_token = clob_ids[0] if len(clob_ids) > 0 else None
+                            no_token = clob_ids[1] if len(clob_ids) > 1 else None
+                            
+                            if condition_id and yes_token:
+                                logger.info(f"✅ Resolved: {market.get('question')} → {condition_id}")
+                                return condition_id, {"yes": yes_token, "no": no_token}, tick_size, neg_risk
 
-                        markets = [
-                            m for m in markets
-                            if search_slug in m.get("slug", "").lower()
-                        ]
-
-                        if not markets:
-                            logger.warning(f"No active market found for {search_slug}")
-                            return None, None
-
-                        markets = sorted(
-                            markets,
-                            key=lambda m: m.get("endDate") or m.get("end_date_iso") or "",
-                            reverse=True
-                        )
-                        market = markets[0]
-
-                        condition_id = market.get("conditionId") or market.get("condition_id")
-                        clob_token_ids = market.get("clobTokenIds", [])
-                        token_id = clob_token_ids[0] if clob_token_ids else None
-                        question = market.get("question", search_slug)
-
-                        if condition_id and token_id:
-                            logger.info(f"Resolved: {question} → {condition_id}")
-                            return condition_id, token_id
+            slug = COIN_SLUGS.get(coin.lower())
+            if slug:
+                logger.info(f"Fallback: Searching via Event Slug: {slug}...")
+                async with aiohttp.ClientSession() as session:
+                    gamma_url = f"https://gamma-api.polymarket.com/events?slug={slug}&active=true"
+                    async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data:
+                                event = data[0]
+                                markets = event.get("markets", [])
+                                for m in markets:
+                                    q = m.get("question", "").lower()
+                                    if (timeframe.lower() in q or timeframe.lower() in m.get("slug", "")) and \
+                                       not m.get("closed", False) and \
+                                       m.get("enableOrderBook", False):
+                                        
+                                        clob_ids = m.get("clobTokenIds", [])
+                                        if isinstance(clob_ids, str):
+                                            clob_ids = json.loads(clob_ids)
+                                        
+                                        tick_size = float(m.get("minimumTickSize", 0.01))
+                                        neg_risk = m.get("negRisk", False)
+                                        
+                                        if clob_ids:
+                                            yes_token = clob_ids[0] if len(clob_ids) > 0 else None
+                                            no_token = clob_ids[1] if len(clob_ids) > 1 else None
+                                            logger.info(f"✅ Resolved via Event: {m.get('question')} → {m.get('conditionId')} (Tick: {tick_size})")
+                                            return m.get("conditionId"), {"yes": yes_token, "no": no_token}, tick_size, neg_risk
 
         except Exception as e:
-            logger.error(f"Contract resolution failed for {search_slug}: {e}")
+            logger.error(f"Market resolution failed: {e}")
 
-        return None, None
-
+        logger.warning(f"❌ No active {coin.upper()} {timeframe} market found.")
+        return None, None, 0.01, False
+    
     async def add_coin_market(self, coin: str, timeframe: str):
-        market_id, token_id = await self.resolve_active_contract(coin, timeframe)
-        if market_id and token_id:
-            self.active_markets[market_id] = token_id
+        market_id, tokens, tick_size, neg_risk = await self.resolve_active_contract(coin, timeframe)
+        if market_id and tokens:
+            self.active_markets[market_id] = tokens
             self.market_metadata[market_id] = {
                 "coin": coin,
                 "timeframe": timeframe,
+                "tick_size": tick_size,
+                "neg_risk": neg_risk
             }
             logger.info(f"Added {coin.upper()} {timeframe} → {market_id}")
-            return market_id, token_id
-        return None, None
+            return market_id, tokens
+        else:
+            key = (coin.lower(), timeframe.lower())
+            if key not in self._polling:
+                self._polling.add(key)
+                logger.info(f"No active {coin.upper()} {timeframe} market yet. Starting poller...")
+                asyncio.create_task(self._poll_for_market(coin, timeframe))
+            return None, None
 
     def remove_coin_market(self, coin: str, timeframe: str):
-        to_remove = [
-            mid for mid, meta in self.market_metadata.items()
-            if meta.get("coin") == coin and meta.get("timeframe") == timeframe
-        ]
+        to_remove = []
+        for mid, meta in self.market_metadata.items():
+            if meta.get("coin") == coin and meta.get("timeframe") == timeframe:
+                to_remove.append(mid)
+        
         for mid in to_remove:
             self.active_markets.pop(mid, None)
             self.market_metadata.pop(mid, None)
-            logger.info(f"Removed {coin.upper()} {timeframe} market.")
+            logger.info(f"Removed market: {mid} ({coin} {timeframe})")
+
+    async def _poll_for_market(self, coin: str, timeframe: str, interval: int = 10):
+        key = (coin.lower(), timeframe.lower())
+        logger.info(f"Polling for {coin.upper()} {timeframe} market every {interval}s...")
+        try:
+            while self.running:
+                await asyncio.sleep(interval)
+                market_id, tokens, tick_size, neg_risk = await self.resolve_active_contract(coin, timeframe)
+                if market_id and tokens:
+                    if market_id not in self.active_markets:
+                        self.active_markets[market_id] = tokens
+                        self.market_metadata[market_id] = {
+                            "coin": coin,
+                            "timeframe": timeframe,
+                            "tick_size": tick_size,
+                            "neg_risk": neg_risk
+                        }
+                        logger.info(f"✅ Market opened! Auto-added {coin.upper()} {timeframe} → {market_id}")
+                    break
+                else:
+                    logger.info(f"Still waiting for {coin.upper()} {timeframe} market...")
+        finally:
+            self._polling.discard(key)
+
+    async def watch_market_expiry(self):
+        while True:
+            await asyncio.sleep(60)
+            expired = []
+            for market_id, meta in list(self.market_metadata.items()):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        url = f"https://gamma-api.polymarket.com/markets?conditionId={market_id}"
+                        async with session.get(url, headers=BROWSER_HEADERS) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                if data and data[0].get("closed", False):
+                                    expired.append((market_id, meta))
+                except Exception as e:
+                    logger.error(f"Expiry check failed for {market_id}: {e}")
+
+            for market_id, meta in expired:
+                coin = meta.get("coin")
+                timeframe = meta.get("timeframe")
+                logger.info(f"Market {market_id} resolved. Finding next {coin.upper()} {timeframe}...")
+                self.active_markets.pop(market_id, None)
+                self.market_metadata.pop(market_id, None)
+                asyncio.create_task(self._poll_for_market(coin, timeframe, interval=10))
+
+    async def start_feed(self):
+        self.running = True
+        
+        while self.running:
+            token_ids = []
+            for tokens in self.active_markets.values():
+                if isinstance(tokens, dict):
+                    if tokens.get("yes"): token_ids.append(tokens["yes"])
+                    if tokens.get("no"): token_ids.append(tokens["no"])
+
+            if not token_ids:
+                await asyncio.sleep(2)
+                continue
+            
+            try:
+                logger.info(f"🔌 Connecting to Polymarket WebSocket for {len(token_ids)} assets...")
+                
+                ws_headers = {
+                    'User-Agent': BROWSER_HEADERS['User-Agent'],
+                    'Origin': BROWSER_HEADERS['Origin'],
+                    'Referer': BROWSER_HEADERS['Referer']
+                }
+                
+                async with websockets.connect(POLYMARKET_WS_URL, extra_headers=ws_headers) as ws:
+                    subscribe_msg = {
+                        "assets_ids": token_ids,
+                        "type": "market",
+                        "custom_feature_enabled": True
+                    }
+                    await ws.send(json.dumps(subscribe_msg))
+                    logger.info("✅ WebSocket subscribed successfully.")
+                    
+                    while self.running:
+                        current_ids = []
+                        for tokens in self.active_markets.values():
+                            if isinstance(tokens, dict):
+                                if tokens.get("yes"): current_ids.append(tokens["yes"])
+                                if tokens.get("no"): current_ids.append(tokens["no"])
+
+                        if set(current_ids) != set(token_ids):
+                            logger.info("🔄 Markets updated, reconnecting WebSocket...")
+                            break
+                            
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                            await self._handle_message(raw)
+                        except asyncio.TimeoutError:
+                            await ws.ping()
+            except Exception as e:
+                logger.error(f"❌ WebSocket error: {e}. Reconnecting in 5s...")
+                await asyncio.sleep(5)
 
     async def add_market_from_url(self, url: str):
         try:
             slug = url.rstrip("/").split("/event/")[1].split("/")[0].split("#")[0] if "/event/" in url else url.rstrip("/").split("/")[-1].split("#")[0]
-            token_id = await self._resolve_token_id(slug)
-            if token_id:
-                self.active_markets[slug] = token_id
-                logger.info(f"Manual market added: {slug}")
-                return slug, token_id
+            condition_id, tokens, tick_size = await self._resolve_token_id_with_tick(slug)
+            if condition_id and tokens and tokens.get("yes"):
+                self.active_markets[condition_id] = tokens
+                self.market_metadata[condition_id] = {
+                    "slug": slug,
+                    "tick_size": tick_size
+                }
+                logger.info(f"Manual market added: {condition_id} (Slug: {slug}, Tick: {tick_size})")
+                return condition_id, tokens
             else:
-                logger.warning(f"Could not resolve token_id for: {slug}")
+                logger.warning(f"Could not resolve tokens for: {slug}")
                 return None, None
         except Exception as e:
             logger.error(f"URL parse error: {e}")
             return None, None
 
-    async def _resolve_token_id(self, slug: str):
-        clob_url = f"{CLOB_API_URL}/markets/{slug}"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(clob_url, headers=BROWSER_HEADERS) as resp:
-                    logger.info(f"CLOB API [{resp.status}] for slug: {slug}")
-                    if resp.status == 200:
-                        data = await resp.json()
-                        tokens = data.get("tokens", [])
-                        for token in tokens:
-                            if token.get("outcome") == "Yes":
-                                return token.get("token_id")
-                    else:
-                        raw = await resp.text()
-                        logger.error(f"CLOB error {resp.status}: {raw[:200]}")
-        except Exception as e:
-            logger.error(f"CLOB request failed: {e}")
-
-        gamma_url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+    async def _resolve_token_id_with_tick(self, slug: str):
+        gamma_url = f"https://gamma-api.polymarket.com/markets?slug={slug}&active=true"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
@@ -153,13 +298,54 @@ class MarketIngestion:
                         data = await resp.json()
                         markets = data if isinstance(data, list) else data.get("data", [])
                         if markets:
-                            clob_ids = markets[0].get("clobTokenIds", [])
-                            if clob_ids:
-                                return clob_ids[0]
-        except Exception as e:
-            logger.error(f"Gamma fallback failed: {e}")
+                            market = markets[0]
+                            condition_id = market.get("conditionId")
+                            if not market.get("enableOrderBook", False):
+                                logger.warning(f"Market {slug} is NOT a CLOB market (AMM only).")
+                                return None, None, 0.01
 
-        return None
+                            clob_ids = market.get("clobTokenIds", [])
+                            if isinstance(clob_ids, str):
+                                clob_ids = json.loads(clob_ids)
+                            
+                            yes_token = clob_ids[0] if len(clob_ids) > 0 else None
+                            no_token = clob_ids[1] if len(clob_ids) > 1 else None
+                            tokens = {"yes": yes_token, "no": no_token}
+                            
+                            tick_size = float(market.get("minimumTickSize", 0.01))
+                            if yes_token and condition_id:
+                                if self.clob_client:
+                                    try:
+                                        price_data = self.clob_client.get_price(yes_token)
+                                        current_price = float(price_data.get("price", 0))
+                                        if current_price > 0:
+                                            asyncio.create_task(self.on_price_update(condition_id, current_price))
+                                    except: pass
+                                return condition_id, tokens, tick_size
+        except Exception as e:
+            logger.error(f"Gamma slug resolution failed: {e}")
+
+        clob_url = f"{CLOB_API_URL}/markets/{slug}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(clob_url, headers=BROWSER_HEADERS) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("accepting_orders"):
+                            condition_id = data.get("condition_id")
+                            clob_tokens = data.get("tokens", [])
+                            tick_size = float(data.get("minimum_tick_size", 0.01))
+                            yes_token = next((t.get("token_id") for t in clob_tokens if t.get("outcome") == "Yes"), None)
+                            no_token = next((t.get("token_id") for t in clob_tokens if t.get("outcome") == "No"), None)
+                            return condition_id, {"yes": yes_token, "no": no_token}, tick_size
+        except Exception as e:
+            logger.error(f"CLOB slug resolution failed: {e}")
+
+        return None, None, 0.01
+
+    async def _resolve_token_id(self, slug: str):
+        condition_id, tokens, tick = await self._resolve_token_id_with_tick(slug)
+        return tokens.get("yes") if tokens else None
 
     async def fetch_event_submarkets(self, url: str):
         try:
@@ -169,9 +355,7 @@ class MarketIngestion:
             async with aiohttp.ClientSession() as session:
                 gamma_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
                 async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
-                    logger.info(f"Gamma API status: {resp.status} for slug: {slug}")
                     raw = await resp.text()
-                    logger.info(f"Gamma response preview: {raw[:300]}")
 
                     if resp.status == 200:
                         data = json.loads(raw)
@@ -181,7 +365,6 @@ class MarketIngestion:
                         event = data[0]
                         event_title = event.get("title", slug)
                         markets = event.get("markets", [])
-                        logger.info(f"Found {len(markets)} sub-markets for: {event_title}")
 
                         if not markets:
                             return [], event_title
@@ -202,70 +385,116 @@ class MarketIngestion:
                             })
 
                         result.sort(key=lambda x: x["liquidity"], reverse=True)
-                        logger.info(f"Returning {len(result)} sub-markets")
                         return result, event_title
-                    else:
-                        logger.error(f"Gamma API error {resp.status}: {raw[:200]}")
-
         except Exception as e:
             logger.error(f"Sub-market fetch failed: {e}")
 
         return [], None
 
     async def scan_all_crypto_markets(self):
-        logger.info("Scanning all crypto Up/Down markets...")
-        tasks = []
-        for coin in COIN_SLUGS:
-            for tf in VALID_TIMEFRAMES:
-                tasks.append(self.add_coin_market(coin, tf))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        loaded = sum(1 for r in results if r and r[0] is not None)
-        logger.info(f"Bulk scan complete. Loaded {loaded} markets.")
+        import time
+        logger.info("⚡ Executing High-Frequency Deterministic Market Discovery...")
+        
+        now = int(time.time())
+        window_ts = now - (now % 300) 
+        
+        async with aiohttp.ClientSession() as session:
+            for coin, base_slug in COIN_SLUGS.items():
+                deterministic_slug = f"{coin}-updown-5m-{window_ts}"
+                url = f"https://gamma-api.polymarket.com/events?slug={deterministic_slug}"
+                
+                try:
+                    async with session.get(url, headers=BROWSER_HEADERS) as resp:
+                        if resp.status != 200:
+                            url = f"https://gamma-api.polymarket.com/events?slug={base_slug}"
+                            async with session.get(url, headers=BROWSER_HEADERS) as fallback_resp:
+                                if fallback_resp.status != 200:
+                                    continue
+                                events = await fallback_resp.json()
+                        else:
+                            events = await resp.json()
 
-    async def start_feed(self):
-        self.running = True
-        while self.running:
-            token_ids = list(self.active_markets.values())
-            if not token_ids:
-                logger.warning("No markets loaded.")
-                await asyncio.sleep(5)
-                continue
-            try:
-                async with websockets.connect(POLYMARKET_WS_URL) as ws:
-                    subscribe_msg = {
-                        "type": "subscribe",
-                        "channel": "market",
-                        "assets_ids": token_ids
-                    }
-                    await ws.send(json.dumps(subscribe_msg))
-                    logger.info(f"WebSocket subscribed to {len(token_ids)} markets.")
-                    while self.running:
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                            await self._handle_message(raw)
-                        except asyncio.TimeoutError:
-                            await ws.ping()
-            except Exception as e:
-                logger.error(f"WebSocket error: {e}. Reconnecting in 5s...")
-                await asyncio.sleep(5)
+                        if not events or not isinstance(events, list):
+                            continue
+                        
+                        markets = events[0].get("markets", [])
+                        
+                        for market in markets:
+                            if not market.get("closed", False) and market.get("enableOrderBook", True):
+                                market_id = market.get("conditionId")
+                                token_ids_str = market.get("clobTokenIds")
+                                
+                                if isinstance(token_ids_str, str):
+                                    token_ids = json.loads(token_ids_str)
+                                else:
+                                    token_ids = token_ids_str
+                                
+                                if market_id and token_ids and len(token_ids) >= 2:
+                                    self.active_markets[market_id] = {
+                                        "yes": token_ids[0],
+                                        "no": token_ids[1]
+                                    }
+                                    self.market_metadata[market_id] = {
+                                        "tick_size": float(market.get("tickSize", 0.01)),
+                                        "neg_risk": market.get("negRisk", False),
+                                        "question": market.get("question")
+                                    }
+                                    logger.info(f"🎯 LOCKED ONTO LIVE TARGET ({coin.upper()}): {market.get('question')}")
+                                    break
+                except Exception as e:
+                    logger.error(f"❌ Exception in market scanner for {coin}: {e}")
 
     async def _handle_message(self, raw: str):
         try:
             data = json.loads(raw)
             for event in data if isinstance(data, list) else [data]:
-                token_id = event.get("asset_id")
-                price = float(event.get("price", 0))
-                market_id = self._token_to_market(token_id)
-                if market_id and price > 0:
-                    await self.on_price_update(market_id, price)
+                event_type = event.get("event_type")
+
+                if event_type == "price_change":
+                    for change in event.get("price_changes", []):
+                        token_id = change.get("asset_id")
+                        price = float(change.get("price", 0))
+                        market_id, side = self._resolve_market_and_side(token_id)
+                        if market_id and price > 0:
+                            yes_price = float(price if side == "yes" else round(1 - price, 4))
+                            # Restored layout signature tracking back to Orchestration layers
+                            await self.on_price_update(market_id, yes_price)
+
+                elif event_type in ("last_trade_price", "book"):
+                    token_id = event.get("asset_id")
+                    price = float(event.get("price", 0))
+                    market_id, side = self._resolve_market_and_side(token_id)
+                    if market_id and price > 0:
+                        yes_price = float(price if side == "yes" else round(1 - price, 4))
+                        await self.on_price_update(market_id, yes_price)
+
+                elif event_type == "best_bid_ask":
+                    token_id = event.get("asset_id")
+                    best_bid = float(event.get("best_bid", 0))
+                    best_ask = float(event.get("best_ask", 0))
+                    mid = round((best_bid + best_ask) / 2, 4) if best_bid and best_ask else 0
+                    market_id, side = self._resolve_market_and_side(token_id)
+                    if market_id and mid > 0:
+                        yes_price = float(mid if side == "yes" else round(1 - mid, 4))
+                        await self.on_price_update(market_id, yes_price)
+
         except Exception as e:
             logger.error(f"Message parse error: {e}")
 
+    def _resolve_market_and_side(self, token_id: str):
+        for market_id, tokens in self.active_markets.items():
+            if isinstance(tokens, dict):
+                if tokens.get("yes") == token_id:
+                    return market_id, "yes"
+                if tokens.get("no") == token_id:
+                    return market_id, "no"
+            elif tokens == token_id:
+                return market_id, "yes"
+        return None, None
+
     def _token_to_market(self, token_id: str):
-        for market_id, tid in self.active_markets.items():
-            if tid == token_id:
-                return market_id
-        return None
+        mid, side = self._resolve_market_and_side(token_id)
+        return mid
 
     def stop_feed(self):
         self.running = False
