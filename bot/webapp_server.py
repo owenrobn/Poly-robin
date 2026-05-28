@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+from settings import settings_manager
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,21 @@ async def toggle_auto(data: dict):
         return {"status": "off"}
 
 
+def apply_settings(swing, data=None):
+    """Apply settings from settings_manager or provided data to a swing instance."""
+    s = settings_manager.get_all()
+    if data:
+        s.update(data)
+    
+    swing.entry_threshold = float(s.get("entry", 70)) / 100
+    swing.flip_threshold = float(s.get("flip", 60)) / 100
+    swing.take_profit_price = float(s.get("tp", 95)) / 100
+    swing.stop_loss_price = float(s.get("stopLoss", 45)) / 100
+    swing.buy_buffer = float(s.get("buffer", 2)) / 100
+    swing.num_shares = float(s.get("shares", 10))
+    swing.cooldown_seconds = float(s.get("cooldown", 30))
+    swing.auto_redeem = s.get("autoRedeem", True)
+
 @app.post("/api/trade")
 async def start_trade(data: dict):
     from strategy.swing_flip import SwingFlip
@@ -106,23 +122,31 @@ async def start_trade(data: dict):
         market_id=market_id,
         tokens=tokens,
         pocket=_pocket,
-        clob_client=_pocket.get_client(),
         notify=None,
+        on_done=_risk.close_trade_async,
         tick_size=tick_size,
         neg_risk=meta.get("neg_risk", False)
     )
-    swing.entry_threshold = data.get("entry", 70) / 100
-    swing.flip_threshold = data.get("flip", 60) / 100
-    swing.take_profit = data.get("tp", 95) / 100
-    swing.stop_loss = data.get("stopLoss", 45) / 100
-    swing.buy_buffer = data.get("buffer", 2) / 100
+    
+    # Apply settings (merging any one-off overrides from the UI)
+    apply_settings(swing, data)
+    
     _risk.register_trade(market_id, swing)
     return {"status": "started", "market_id": market_id}
 
 
+@app.get("/api/params")
+async def get_params():
+    return settings_manager.get_all()
+
 @app.post("/api/params")
 async def save_params(data: dict):
-    return {"status": "saved", "params": data}
+    settings_manager.save(data)
+    # Also update any active trades that haven't entered yet
+    for swing in _risk.active_trades.values():
+        if swing.position is None:
+            apply_settings(swing)
+    return {"status": "saved", "params": settings_manager.get_all()}
 
 
 @app.post("/api/kill")

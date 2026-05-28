@@ -32,8 +32,13 @@ class SwingFlip:
         # Strategic Thresholds
         self.entry_threshold = float(ENTRY_THRESHOLD)
         self.flip_threshold = float(FLIP_THRESHOLD)
-        self.take_profit_pct = 0.50  # 50% profit from entry
-        self.stop_loss_pct = 0.20    # 20% loss from entry
+        self.take_profit_pct = 0.50  # 50% profit from entry (relative)
+        self.stop_loss_pct = 0.20    # 20% loss from entry (relative)
+        
+        # Absolute targets (optional, overrides relative)
+        self.take_profit_price = None
+        self.stop_loss_price = None
+        
         self.buy_buffer = 0.01       # 1 cent buffer
         self.num_shares = float(MIN_SHARES) 
         self.cooldown_seconds = float(COOLDOWN_SECONDS)
@@ -95,12 +100,17 @@ class SwingFlip:
                 await self._buy("NO", buy_price, size)
 
     async def _manage_yes_position(self, yes_price: float):
-        # Calculate relative TP/SL if we have an entry price
-        # Default to config values if relative logic exceeds bounds
-        tp_price = self.entry_price + (self.entry_price * self.take_profit_pct) if self.entry_price else TAKE_PROFIT
-        tp_price = min(tp_price, TAKE_PROFIT) # Cap at config's absolute TP
+        # Determine targets
+        if self.take_profit_price:
+            tp_price = self.take_profit_price
+        else:
+            tp_price = self.entry_price + (self.entry_price * self.take_profit_pct) if self.entry_price else TAKE_PROFIT
+            tp_price = min(tp_price, TAKE_PROFIT) 
         
-        sl_price = self.entry_price - (self.entry_price * self.stop_loss_pct) if self.entry_price else 0.45
+        if self.stop_loss_price:
+            sl_price = self.stop_loss_price
+        else:
+            sl_price = self.entry_price - (self.entry_price * self.stop_loss_pct) if self.entry_price else 0.45
 
         if yes_price >= tp_price:
             await self._close_position(yes_price, reason=f"Take Profit (Target: ${tp_price:.2f})")
@@ -139,11 +149,17 @@ class SwingFlip:
                 self.is_placing_order = False
 
     async def _manage_no_position(self, no_price: float):
-        # Calculate relative TP/SL
-        tp_price = self.entry_price + (self.entry_price * self.take_profit_pct) if self.entry_price else TAKE_PROFIT
-        tp_price = min(tp_price, TAKE_PROFIT)
+        # Determine targets
+        if self.take_profit_price:
+            tp_price = self.take_profit_price
+        else:
+            tp_price = self.entry_price + (self.entry_price * self.take_profit_pct) if self.entry_price else TAKE_PROFIT
+            tp_price = min(tp_price, TAKE_PROFIT)
         
-        sl_price = self.entry_price - (self.entry_price * self.stop_loss_pct) if self.entry_price else 0.45
+        if self.stop_loss_price:
+            sl_price = self.stop_loss_price
+        else:
+            sl_price = self.entry_price - (self.entry_price * self.stop_loss_pct) if self.entry_price else 0.45
 
         if no_price >= tp_price:
             await self._close_position(no_price, reason=f"NO Take Profit (Target: ${tp_price:.2f})")

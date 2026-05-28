@@ -60,12 +60,16 @@ class Pocket:
 
     async def refresh_balances(self, force=False):
         now = time.time()
-        if not force and (now - self.last_refresh < 30):
+        if not force and self.last_refresh > 0 and (now - self.last_refresh < 30):
             return
             
-        self.usdc_balance = float(await self._get_balance())
-        self.last_refresh = now
-        logger.info(f"Polymarket balance: ${self.usdc_balance:.2f}")
+        try:
+            balance = float(await self._get_balance())
+            self.usdc_balance = balance
+            self.last_refresh = now
+            logger.info(f"Polymarket balance refreshed: ${self.usdc_balance:.6f}")
+        except Exception as e:
+            logger.error(f"Failed to refresh balance: {e}")
 
     async def _get_balance(self) -> float:
         try:

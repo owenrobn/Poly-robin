@@ -11,6 +11,7 @@ from wallet.pocket import Pocket
 from market.ingestion import MarketIngestion
 from risk.controls import RiskControls
 from strategy.swing_flip import SwingFlip
+from settings import settings_manager
 
 logger = logging.getLogger(__name__)
 
@@ -71,28 +72,43 @@ class PolyRobinBot:
             reply_markup=self._main_keyboard()
         )
 
+    def _configure_swing(self, swing, overrides=None):
+        """Apply global settings and any manual overrides to a swing instance."""
+        s = settings_manager.get_all()
+        if overrides:
+            s.update(overrides)
+            
+        swing.entry_threshold = float(s.get("entry", 70)) / 100
+        swing.flip_threshold = float(s.get("flip", 60)) / 100
+        swing.take_profit_price = float(s.get("tp", 95)) / 100
+        swing.stop_loss_price = float(s.get("stopLoss", 45)) / 100
+        swing.buy_buffer = float(s.get("buffer", 2)) / 100
+        swing.num_shares = float(s.get("shares", 10))
+        swing.cooldown_seconds = float(s.get("cooldown", 30))
+        swing.auto_redeem = s.get("autoRedeem", True)
+
     async def cmd_trade(
         self, update: Update,
         context: ContextTypes.DEFAULT_TYPE
     ):
         args = context.args
-        if len(args) < 3:
+        if len(args) < 1:
             await update.message.reply_text(
-                "Usage: /trade [url] [entry] [flip]\n"
+                "Usage: /trade [url] [optional: entry] [optional: flip]\n"
                 "Example: /trade https://polymarket.com/... 0.70 0.60"
             )
             return
-        url, entry, flip = args[0], float(args[1]), float(args[2])
+        url = args[0]
+        overrides = {}
+        if len(args) >= 2: overrides["entry"] = float(args[1]) * 100
+        if len(args) >= 3: overrides["flip"] = float(args[2]) * 100
+        
         market_id, token_id = await self.ingestion.add_market_from_url(url)
         if not market_id:
-            await update.message.reply_text(
-                "❌ Could not resolve market. Check the URL."
-            )
+            await update.message.reply_text("❌ Could not resolve market.")
             return
         if not self.risk.can_open_trade(market_id):
-            await update.message.reply_text(
-                "⚠️ Trade blocked by risk controls."
-            )
+            await update.message.reply_text("⚠️ Trade blocked by risk controls.")
             return
             
         meta = self.ingestion.market_metadata.get(market_id, {})
@@ -108,13 +124,12 @@ class PolyRobinBot:
             tick_size=tick_size,
             neg_risk=meta.get("neg_risk", False)
         )
-        swing.entry_threshold = entry
-        swing.flip_threshold = flip
+        self._configure_swing(swing, overrides)
         self.risk.register_trade(market_id, swing)
         await update.message.reply_text(
             f"✅ Trade set up!\n"
             f"Market: {market_id}\n"
-            f"Entry: {entry:.2f} | Flip: {flip:.2f}",
+            f"Entry: {swing.entry_threshold:.2f} | Flip: {swing.flip_threshold:.2f}",
             reply_markup=self._main_keyboard()
         )
 
@@ -247,10 +262,7 @@ class PolyRobinBot:
                 tick_size=tick_size,
                 neg_risk=meta.get("neg_risk", False)
             )
-            # Apply default thresholds from config
-            from config import ENTRY_THRESHOLD, FLIP_THRESHOLD
-            swing.entry_threshold = float(ENTRY_THRESHOLD)
-            swing.flip_threshold = float(FLIP_THRESHOLD)
+            self._configure_swing(swing)
             
             self.risk.register_trade(market_id, swing)
             await swing.on_price_update(price)

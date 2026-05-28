@@ -12,33 +12,35 @@ ENTRY_THRESHOLD = 0.55  # Your target virtual probability or signal boundary
 TICK_INTERVAL = 2       # Scan underlying price every 2 seconds
 
 def get_live_crypto_prices():
-    """Fetches high-accuracy spot prices from a public feed."""
+    """Fetches high-accuracy spot prices from public feeds."""
+    # Try Binance first as it often has better global availability/latency
     try:
-        # Using Coinbase public ticker as a fallback/alternative reference
-        url = "https://api.exchange.coinbase.com/products"
+        url = "https://api.binance.com/api/v3/ticker/price"
+        resp = requests.get(url, timeout=15).json()
+        prices = {}
+        for item in resp:
+            symbol = item['symbol']
+            for coin in COINS:
+                if symbol == f"{coin.upper()}USDT":
+                    prices[coin] = float(item['price'])
+        if prices:
+            return prices
+    except Exception as e:
+        logger.debug(f"Binance fetch failed: {e}")
+
+    # Fallback to Coinbase
+    try:
         prices = {}
         for coin in COINS:
             pair = f"{coin.upper()}-USD"
             price_url = f"https://api.exchange.coinbase.com/products/{pair}/ticker"
-            resp = requests.get(price_url, timeout=5).json()
+            resp = requests.get(price_url, timeout=15).json()
             if 'price' in resp:
                 prices[coin] = float(resp['price'])
         return prices
     except Exception as e:
-        logger.error(f"Failed to fetch live index prices: {e}")
-        # Try Binance as fallback if Coinbase fails
-        try:
-            url = f"https://api.binance.com/api/v3/ticker/price"
-            resp = requests.get(url, timeout=5).json()
-            prices = {}
-            for item in resp:
-                symbol = item['symbol']
-                for coin in COINS:
-                    if symbol == f"{coin.upper()}USDT":
-                        prices[coin] = float(item['price'])
-            return prices
-        except:
-            return None
+        logger.error(f"All price feeds failed: {e}")
+        return None
 
 def monitor_market_trends():
     logger.info("📡 Continuous index market scanner active...")

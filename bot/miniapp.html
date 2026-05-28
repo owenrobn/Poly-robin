@@ -534,8 +534,23 @@ function updateActiveCount() {
   document.getElementById('activeCount').textContent = `${count}/${coins.length}`;
 }
 
-function updateParam(key, value) {
-  params[key] = parseInt(value);
+async function fetchParams() {
+  try {
+    const res = await fetch('/api/params');
+    const data = await res.json();
+    params = data;
+    // Update all sliders and values
+    Object.keys(params).forEach(key => {
+      const el = document.querySelector(`input[oninput*="updateParam('${key}'"]`);
+      if (el) el.value = params[key];
+      updateParam(key, params[key], false); // false to skip saving back
+    });
+    updateCalculator();
+  } catch (e) {}
+}
+
+function updateParam(key, value, shouldSave = true) {
+  params[key] = key === 'autoRedeem' ? value : parseInt(value);
   const ids    = { entry:'entryVal', flip:'flipVal', tp:'tpVal', stopLoss:'stopLossVal', buffer:'bufferVal', shares:'sharesVal', maxTrades:'maxTradesVal', cooldown:'cooldownVal' };
   const sfx    = { entry:'c', flip:'c', tp:'c', stopLoss:'c', buffer:'c', shares:'', maxTrades:'', cooldown:'s' };
   const pfx    = { buffer:'+' };
@@ -736,6 +751,7 @@ async function fetchBalance() {
 }
 
 function toggleAutoRedeem(el) {
+  params.autoRedeem = el.checked;
   sendToBot('/api/auto-redeem', { enabled: el.checked });
   showToast(el.checked ? '✅ Auto redeem enabled' : '⏹ Auto redeem disabled');
 }
@@ -756,6 +772,7 @@ function showToast(msg) {
 // Init
 renderCoins();
 fetchBalance();
+fetchParams();
 updateCalculator();
 setInterval(fetchBalance, 15000);
 </script>
