@@ -15,7 +15,8 @@ DEFAULT_SETTINGS = {
     "shares": 10,
     "maxTrades": 3,
     "cooldown": 30,
-    "autoRedeem": True
+    "autoRedeem": True,
+    "master": False
 }
 
 class SettingsManager:

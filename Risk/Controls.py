@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from config import MAX_ACTIVE_TRADES
+from settings import settings_manager
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +20,11 @@ class RiskControls:
         if market_id in self.active_trades:
             logger.info(f"Already trading {market_id}.")
             return False
-        if len(self.active_trades) >= MAX_ACTIVE_TRADES:
+        max_trades = int(settings_manager.get("maxTrades", MAX_ACTIVE_TRADES))
+        if len(self.active_trades) >= max_trades:
             logger.warning(
                 f"Max active trades reached "
-                f"({MAX_ACTIVE_TRADES}). Skipping {market_id}."
+                f"({max_trades}). Skipping {market_id}."
             )
             return False
         if not self.pocket.is_ready():

@@ -50,20 +50,24 @@ class MarketIngestion:
         }
         name = coin_names.get(coin.lower(), coin.upper())
         
-        # Determine current UTC time and match 5m interval for slug matching
+        # Determine current UTC time and match interval for slug matching
         import time
         now = int(time.time())
-        window_ts = now - (now % 300) 
+        
+        # Map timeframe to seconds
+        tf_map = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+        seconds = tf_map.get(timeframe.lower(), 300)
+        window_ts = now - (now % seconds) 
         
         # Try deterministic slug first (most reliable for up/down)
-        deterministic_slug = f"{coin.lower()}-updown-5m-{window_ts}"
+        deterministic_slug = f"{coin.lower()}-updown-{timeframe.lower()}-{window_ts}"
         logger.info(f"Trying deterministic slug: {deterministic_slug}")
         
-        tokens, tick_size = await self._resolve_token_id_with_tick(deterministic_slug)
-        if tokens:
-            return deterministic_slug, tokens, tick_size, False
+        cond_id, tokens, tick_size = await self._resolve_token_id_with_tick(deterministic_slug)
+        if tokens and cond_id:
+            return cond_id, tokens, tick_size, False
         
-        # Fallback to search
+        # Fallback to search (strict filtering to avoid wrong markets)
         search_query = f"{name} Up or Down"
         logger.info(f"Searching for active {name} via Gamma Query...")
         
@@ -76,17 +80,24 @@ class MarketIngestion:
                         clob_markets = [m for m in markets if m.get("enableOrderBook") and m.get("clobTokenIds")]
                         
                         if clob_markets:
-                            # Prioritize timeframe match
-                            valid = [
-                                m for m in clob_markets
-                                if timeframe.lower() in (m.get("question", "").lower() + m.get("slug", "").lower())
-                                or "5-minute" in m.get("question", "").lower()
-                            ]
+                            prefix = f"{coin.lower()}-updown"
+                            valid = []
+                            for m in clob_markets:
+                                slug = (m.get("slug") or "").lower()
+                                q = (m.get("question") or "").lower()
+                                if prefix not in (slug + q):
+                                    continue
+                                if timeframe.lower() not in (slug + q):
+                                    continue
+                                valid.append(m)
                             
                             if not valid:
-                                valid = clob_markets
+                                valid = []
                             
                             valid.sort(key=lambda x: x.get("endDate") or "")
+                            if not valid:
+                                return None, None, 0.01, False
+
                             market = valid[0]
                             
                             condition_id = market.get("conditionId")
@@ -140,6 +151,41 @@ class MarketIngestion:
         logger.warning(f"❌ No active {coin.upper()} {timeframe} market found.")
         return None, None, 0.01, False
     
+    async def find_coin_markets(self, coin: str, timeframe: str):
+        """Finds all active contracts for a coin and timeframe for manual selection."""
+        results = []
+        
+        # 1. Try deterministic slug
+        import time
+        now = int(time.time())
+        tf_map = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+        seconds = tf_map.get(timeframe.lower(), 300)
+        window_ts = now - (now % seconds) 
+        deterministic_slug = f"{coin.lower()}-updown-{timeframe.lower()}-{window_ts}"
+        
+        condition_id, tokens, tick_size, neg_risk = await self.resolve_active_contract(coin, timeframe)
+        if condition_id and tokens:
+            # We already have a resolved one, let's get its details
+            gamma_url = f"https://gamma-api.polymarket.com/markets?conditionId={condition_id}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data:
+                            m = data[0]
+                            results.append({
+                                "market_id": condition_id,
+                                "question": m.get("question"),
+                                "slug": m.get("slug"),
+                                "liquidity": float(m.get("liquidity", 0)),
+                                "active": not m.get("closed", False),
+                                "token_id": tokens.get("yes"),
+                                "yes_price": float(m.get("lastTradePrice", 0.5)),
+                                "no_price": float(1 - m.get("lastTradePrice", 0.5))
+                            })
+        
+        return results
+
     async def add_coin_market(self, coin: str, timeframe: str):
         market_id, tokens, tick_size, neg_risk = await self.resolve_active_contract(coin, timeframe)
         if market_id and tokens:
@@ -263,8 +309,10 @@ class MarketIngestion:
                             
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                            logger.debug(f"WS RAW: {raw[:100]}...")
                             await self._handle_message(raw)
                         except asyncio.TimeoutError:
+                            logger.debug("WS Heartbeat...")
                             await ws.ping()
             except Exception as e:
                 logger.error(f"❌ WebSocket error: {e}. Reconnecting in 5s...")
@@ -272,7 +320,14 @@ class MarketIngestion:
 
     async def add_market_from_url(self, url: str):
         try:
-            slug = url.rstrip("/").split("/event/")[1].split("/")[0].split("#")[0] if "/event/" in url else url.rstrip("/").split("/")[-1].split("#")[0]
+            clean_url = url.split("?")[0].split("#")[0].rstrip("/")
+            if "/event/" in clean_url:
+                slug = clean_url.split("/event/")[1].split("/")[0]
+            elif "/market/" in clean_url:
+                slug = clean_url.split("/market/")[1].split("/")[0]
+            else:
+                slug = clean_url.split("/")[-1]
+
             condition_id, tokens, tick_size = await self._resolve_token_id_with_tick(slug)
             if condition_id and tokens and tokens.get("yes"):
                 self.active_markets[condition_id] = tokens
@@ -349,58 +404,85 @@ class MarketIngestion:
 
     async def fetch_event_submarkets(self, url: str):
         try:
-            slug = url.rstrip("/").split("/event/")[1].split("/")[0].split("#")[0] if "/event/" in url else url.rstrip("/").split("/")[-1].split("#")[0]
+            # Clean URL and extract slug accurately
+            clean_url = url.split("?")[0].split("#")[0].rstrip("/")
+            if "/event/" in clean_url:
+                slug = clean_url.split("/event/")[1].split("/")[0]
+            elif "/market/" in clean_url:
+                slug = clean_url.split("/market/")[1].split("/")[0]
+            else:
+                slug = clean_url.split("/")[-1]
+            
             logger.info(f"Fetching sub-markets for slug: {slug}")
 
             async with aiohttp.ClientSession() as session:
+                # 1. Try Gamma Event API
                 gamma_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
                 async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
-                    raw = await resp.text()
-
                     if resp.status == 200:
-                        data = json.loads(raw)
-                        if not data:
-                            return [], None
+                        data = await resp.json()
+                        if data and isinstance(data, list):
+                            event = data[0]
+                            event_title = event.get("title", slug)
+                            markets = event.get("markets", [])
+                            if markets:
+                                result = []
+                                for m in markets:
+                                    clob_ids = m.get("clobTokenIds", [])
+                                    result.append({
+                                        "market_id": m.get("conditionId"),
+                                        "question": m.get("question"),
+                                        "slug": m.get("slug"),
+                                        "liquidity": float(m.get("liquidity", 0)),
+                                        "active": not m.get("closed", False),
+                                        "token_id": clob_ids[0] if clob_ids else None,
+                                        "yes_price": float(m.get("lastTradePrice", 0.5)),
+                                        "no_price": float(1 - m.get("lastTradePrice", 0.5)),
+                                    })
+                                result.sort(key=lambda x: x["liquidity"], reverse=True)
+                                return result, event_title
 
-                        event = data[0]
-                        event_title = event.get("title", slug)
-                        markets = event.get("markets", [])
-
-                        if not markets:
-                            return [], event_title
-
-                        result = []
-                        for m in markets:
+                # 2. Try Gamma Market API (Direct Market URL)
+                market_url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+                async with session.get(market_url, headers=BROWSER_HEADERS) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data and isinstance(data, list):
+                            m = data[0]
                             clob_ids = m.get("clobTokenIds", [])
-                            result.append({
+                            result = [{
                                 "market_id": m.get("conditionId"),
                                 "question": m.get("question"),
                                 "slug": m.get("slug"),
                                 "liquidity": float(m.get("liquidity", 0)),
-                                "end_date": m.get("endDate"),
                                 "active": not m.get("closed", False),
                                 "token_id": clob_ids[0] if clob_ids else None,
-                                "yes_price": 0.5,
-                                "no_price": 0.5,
-                            })
+                                "yes_price": float(m.get("lastTradePrice", 0.5)),
+                                "no_price": float(1 - m.get("lastTradePrice", 0.5)),
+                            }]
+                            return result, m.get("question", slug)
 
-                        result.sort(key=lambda x: x["liquidity"], reverse=True)
-                        return result, event_title
         except Exception as e:
             logger.error(f"Sub-market fetch failed: {e}")
 
         return [], None
 
-    async def scan_all_crypto_markets(self):
+    async def scan_all_crypto_markets(self, timeframe: str = "5m"):
+        """
+        Manually triggered scan from UI to find markets. 
+        Does NOT automatically start trading them.
+        """
         import time
-        logger.info("⚡ Executing High-Frequency Deterministic Market Discovery...")
+        logger.info(f"⚡ Manually Scanning Polymarket Events ({timeframe})...")
         
         now = int(time.time())
-        window_ts = now - (now % 300) 
+        tf_map = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+        seconds = tf_map.get(timeframe.lower(), 300)
+        window_ts = now - (now % seconds) 
         
         async with aiohttp.ClientSession() as session:
             for coin, base_slug in COIN_SLUGS.items():
-                deterministic_slug = f"{coin}-updown-5m-{window_ts}"
+                deterministic_slug = f"{coin}-updown-{timeframe.lower()}-{window_ts}"
                 url = f"https://gamma-api.polymarket.com/events?slug={deterministic_slug}"
                 
                 try:
@@ -434,12 +516,21 @@ class MarketIngestion:
                                         "yes": token_ids[0],
                                         "no": token_ids[1]
                                     }
+                                    
+                                    # Fetch current price immediately for UI
+                                    last_price = float(market.get("lastTradePrice") or 0.5)
+                                    
                                     self.market_metadata[market_id] = {
+                                        "coin": coin,
+                                        "slug": market.get("slug"),
                                         "tick_size": float(market.get("tickSize", 0.01)),
                                         "neg_risk": market.get("negRisk", False),
-                                        "question": market.get("question")
+                                        "question": market.get("question"),
+                                        "last_price": last_price,
+                                        "timeframe": timeframe
                                     }
-                                    logger.info(f"🎯 LOCKED ONTO LIVE TARGET ({coin.upper()}): {market.get('question')}")
+                                    logger.info(f"🔍 MARKET DISCOVERED ({coin.upper()}): {market.get('question')} at ${last_price:.4f}")
+                                    # We do NOT trigger trades here. User must toggle them in UI.
                                     break
                 except Exception as e:
                     logger.error(f"❌ Exception in market scanner for {coin}: {e}")
@@ -457,6 +548,9 @@ class MarketIngestion:
                         market_id, side = self._resolve_market_and_side(token_id)
                         if market_id and price > 0:
                             yes_price = float(price if side == "yes" else round(1 - price, 4))
+                            # Update metadata with last price for UI
+                            if market_id in self.market_metadata:
+                                self.market_metadata[market_id]["last_price"] = yes_price
                             # Restored layout signature tracking back to Orchestration layers
                             await self.on_price_update(market_id, yes_price)
 
@@ -466,6 +560,8 @@ class MarketIngestion:
                     market_id, side = self._resolve_market_and_side(token_id)
                     if market_id and price > 0:
                         yes_price = float(price if side == "yes" else round(1 - price, 4))
+                        if market_id in self.market_metadata:
+                            self.market_metadata[market_id]["last_price"] = yes_price
                         await self.on_price_update(market_id, yes_price)
 
                 elif event_type == "best_bid_ask":

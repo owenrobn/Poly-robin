@@ -23,6 +23,8 @@ logger.setLevel(logging.INFO)
 # 3. Explicitly allow your custom bot architectures to print trades and states
 logging.getLogger("bot").setLevel(logging.INFO)
 logging.getLogger("strategy").setLevel(logging.INFO)
+logging.getLogger("wallet").setLevel(logging.INFO)
+logging.getLogger("market").setLevel(logging.INFO)
 
 # Optional: Directly isolate and quiet third-party libraries if they still bypass root
 logging.getLogger("py_clob_client").setLevel(logging.WARNING)
@@ -42,6 +44,14 @@ async def startup(bot):
     
     logger.info("🚀 Poly-Robin Ingestion Pipeline is fully operational and tracking live ticks!")
 
+def run_headless(bot):
+    async def runner():
+        await startup(bot)
+        while True:
+            await asyncio.sleep(3600)
+
+    asyncio.run(runner())
+
 def main():
     logger.info("Starting Poly-Robin...")
     
@@ -55,16 +65,20 @@ def main():
     server_thread = threading.Thread(
         target=start_server,
         args=(bot.pocket, bot.risk, bot.ingestion),
-        daemon=True
+        daemon=False
     )
     server_thread.start()
     logger.info("Mini App server running on http://localhost:8000")
 
     async def post_init(application):
-        asyncio.ensure_future(startup(bot))
+        asyncio.create_task(startup(bot))
 
-    bot.app.post_init = post_init
-    bot.run()
+    try:
+        bot.app.post_init = post_init
+        bot.run()
+    except BaseException as e:
+        logger.error(f"Telegram bot failed ({type(e).__name__}: {e}). Running headless UI mode.")
+        run_headless(bot)
 
 if __name__ == "__main__":
     main()

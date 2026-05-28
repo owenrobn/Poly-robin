@@ -242,17 +242,16 @@ class PolyRobinBot:
         if market_id in self.risk.active_trades:
             swing = self.risk.active_trades[market_id]
             await swing.on_price_update(price)
-        elif market_id in self.ingestion.active_markets:
-            # Guard against race condition: only register if still not active
+        elif settings_manager.get("master", False) and market_id in self.ingestion.active_markets:
             if not self.risk.can_open_trade(market_id):
                 return
-            # Re-check after can_open_trade to prevent double registration
             if market_id in self.risk.active_trades:
                 return
-            tokens = self.ingestion.active_markets[market_id]
+
+            tokens = self.ingestion.active_markets.get(market_id)
             meta = self.ingestion.market_metadata.get(market_id, {})
             tick_size = meta.get("tick_size", 0.01)
-            await self.pocket.refresh_balances()
+
             swing = SwingFlip(
                 market_id=market_id,
                 tokens=tokens,
@@ -263,9 +262,10 @@ class PolyRobinBot:
                 neg_risk=meta.get("neg_risk", False)
             )
             self._configure_swing(swing)
-            
             self.risk.register_trade(market_id, swing)
             await swing.on_price_update(price)
+        else:
+            return
 
     def run(self):
         logger.info("Poly-Robin bot starting...")

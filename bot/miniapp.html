@@ -218,13 +218,14 @@
     </div>
   </div>
   <div class="header-right">
-    <div class="balance-chip" id="balanceChip">💰 $0.00</div>
+    <div class="balance-chip" id="balanceChip" onclick="fetchBalance()">💰 $0.00</div>
   </div>
 </div>
 
 <!-- MASTER STATUS BAR -->
 <div class="master-bar">
   <div class="master-label">Bot Status: <span id="masterStatus">STOPPED</span></div>
+  <div class="master-label">Portfolio Value: <span id="portfolioVal" class="running">$0.00</span></div>
   <label class="toggle">
     <input type="checkbox" id="masterToggle" onchange="toggleMaster(this)">
     <div class="toggle-track"></div>
@@ -460,77 +461,147 @@
 
 <script>
 const coins = [
-  { id: 'btc',  name: 'BTC',  icon: '₿', color: '#f7931a', pnl: 0, accum: 0 },
-  { id: 'eth',  name: 'ETH',  icon: 'Ξ', color: '#627eea', pnl: 0, accum: 0 },
-  { id: 'sol',  name: 'SOL',  icon: '◎', color: '#9945ff', pnl: 0, accum: 0 },
-  { id: 'xrp',  name: 'XRP',  icon: '✕', color: '#346aa9', pnl: 0, accum: 0 },
-  { id: 'doge', name: 'DOGE', icon: 'Ð', color: '#c2a633', pnl: 0, accum: 0 },
-  { id: 'bnb',  name: 'BNB',  icon: 'B', color: '#f3ba2f', pnl: 0, accum: 0 },
-  { id: 'hype', name: 'HYPE', icon: 'H', color: '#00c2ff', pnl: 0, accum: 0 },
+  { id: 'btc',  name: 'BTC',  icon: '₿', color: '#f7931a', pnl: 0 },
+  { id: 'eth',  name: 'ETH',  icon: 'Ξ', color: '#627eea', pnl: 0 },
+  { id: 'sol',  name: 'SOL',  icon: '◎', color: '#9945ff', pnl: 0 },
+  { id: 'xrp',  name: 'XRP',  icon: '✕', color: '#346aa9', pnl: 0 },
+  { id: 'doge', name: 'DOGE', icon: 'Ð', color: '#c2a633', pnl: 0 },
+  { id: 'bnb',  name: 'BNB',  icon: 'B', color: '#f3ba2f', pnl: 0 },
+  { id: 'hype', name: 'HYPE', icon: 'H', color: '#00c2ff', pnl: 0 },
 ];
 
-let activeCoins = {};
+let activeCoins = { '5m': {}, '15m': {}, '1h': {}, '4h': {} };
 let currentTf = '5m';
 let params = { entry: 70, flip: 60, tp: 95, stopLoss: 45, buffer: 2, shares: 10, maxTrades: 3, cooldown: 30 };
 
+const tfColors = { '5m': '#39ff6e', '15m': '#39e6ff', '1h': '#3988ff', '4h': '#a639ff' };
+
 function renderCoins() {
   const grid = document.getElementById('coinGrid');
-  grid.innerHTML = coins.map(coin => `
-    <div class="coin-card ${activeCoins[coin.id] ? 'active' : ''}" id="card-${coin.id}">
-      <div class="coin-header">
-        <div class="coin-info">
-          <div class="coin-icon" style="background: ${coin.color}22; color: ${coin.color}">${coin.icon}</div>
-          <div class="coin-name-wrap">
-            <div class="coin-name">${coin.name} <span style="font-size:9px;color:var(--muted)">(${currentTf})</span></div>
-            <div class="coin-status ${activeCoins[coin.id] ? 'running' : 'stopped'}">${activeCoins[coin.id] ? 'RUNNING' : 'STOPPED'}</div>
+  grid.innerHTML = coins.map(coin => {
+    const isActive = activeCoins[currentTf][coin.id];
+    // Find other active timeframes for this coin
+    const otherActive = Object.keys(activeCoins).filter(tf => tf !== currentTf && activeCoins[tf][coin.id]);
+    
+    return `
+      <div class="coin-card ${isActive ? 'active' : ''}" id="card-${coin.id}">
+        <div class="coin-header">
+          <div class="coin-info">
+            <div class="coin-icon" style="background: ${coin.color}22; color: ${coin.color}">${coin.icon}</div>
+            <div class="coin-name-wrap">
+              <div class="coin-name">${coin.name} <span style="font-size:9px;color:${tfColors[currentTf]}">(${currentTf})</span></div>
+              <div class="coin-status ${isActive ? 'running' : 'stopped'}">${isActive ? 'RUNNING' : 'STOPPED'}</div>
+              ${otherActive.length > 0 ? `
+                <div style="display:flex; gap:3px; margin-top:2px;">
+                  ${otherActive.map(tf => `<div style="width:4px; height:4px; border-radius:50%; background:${tfColors[tf]}" title="Active in ${tf}"></div>`).join('')}
+                </div>
+              ` : ''}
+            </div>
           </div>
+          <label class="toggle">
+            <input type="checkbox" class="green-toggle" ${isActive ? 'checked' : ''} onchange="toggleCoin('${coin.id}', this)">
+            <div class="toggle-track"></div>
+            <div class="toggle-thumb"></div>
+          </label>
         </div>
-        <label class="toggle">
-          <input type="checkbox" class="green-toggle" ${activeCoins[coin.id] ? 'checked' : ''} onchange="toggleCoin('${coin.id}', this)">
-          <div class="toggle-track"></div>
-          <div class="toggle-thumb"></div>
-        </label>
+        <div class="pnl-row">
+          <div class="pnl-label">Spot Price</div>
+          <div class="pnl-value" style="color: var(--text)" id="spot-${coin.id}">$0.00</div>
+        </div>
+        <div class="pnl-row">
+          <div class="pnl-label">Poly YES (${currentTf})</div>
+          <div class="pnl-value" id="poly-${coin.id}">0.0c</div>
+        </div>
+        <div class="pnl-row"><div class="pnl-label">Cycle P&L</div><div class="pnl-value">+${coin.pnl.toFixed(4)}$</div></div>
       </div>
-      <div class="pnl-row"><div class="pnl-label">Cycle P&L</div><div class="pnl-value">+${coin.pnl.toFixed(4)}$</div></div>
-      <div class="pnl-row"><div class="pnl-label">Accum P&L</div><div class="pnl-value">+${coin.accum.toFixed(4)}$</div></div>
-    </div>
-  `).join('');
+    `;
+  }).join('');
   updateActiveCount();
 }
 
-function toggleCoin(id, el) {
-  activeCoins[id] = el.checked;
-  renderCoins();
-  showToast(el.checked ? `${id.toUpperCase()} trading started (${currentTf})` : `${id.toUpperCase()} stopped`);
-  sendToBot('/api/coin-toggle', { coin: id, enabled: el.checked, timeframe: currentTf });
+async function fetchPrices() {
+  try {
+    const res = await fetch(`/api/prices?timeframe=${currentTf}`);
+    const data = await res.json();
+    
+    // Update Spot prices
+    if (data.index) {
+      Object.keys(data.index).forEach(coin => {
+        const el = document.getElementById(`spot-${coin}`);
+        if (el) el.textContent = `$${data.index[coin].toLocaleString()}`;
+      });
+    }
+    
+    // Update Polymarket prices for CURRENT timeframe
+    if (data.polymarket) {
+      // Note: Backend /api/prices needs to filter by currentTf or we handle it here
+      Object.keys(data.polymarket).forEach(coin => {
+        // Only update if it's the right coin
+        const el = document.getElementById(`poly-${coin}`);
+        if (el) {
+          const val = data.polymarket[coin];
+          el.textContent = val > 0 ? `${(val * 100).toFixed(1)}c` : '---';
+          el.style.color = val >= 0.7 ? 'var(--green)' : (val <= 0.3 ? 'var(--red)' : 'var(--accent)');
+        }
+      });
+    }
+  } catch (e) {}
 }
 
-function toggleMaster(el) {
-  const status = document.getElementById('masterStatus');
-  status.textContent = el.checked ? 'RUNNING' : 'STOPPED';
-  status.className = el.checked ? 'running' : '';
-  document.getElementById('statusDot').className = 'dot ' + (el.checked ? 'online' : '');
-  showToast(el.checked ? '🤖 Bot started' : '⏹ Bot stopped');
-  sendToBot('/api/master', { enabled: el.checked });
+async function toggleCoin(id, el) {
+  const wasChecked = !el.checked;
+  const result = await sendToBot('/api/coin-toggle', { coin: id, enabled: el.checked, timeframe: currentTf });
+  
+  if (result && result.status === 'ok') {
+    activeCoins[currentTf][id] = el.checked;
+    showToast(el.checked ? `${id.toUpperCase()} ${currentTf} trading started` : `${id.toUpperCase()} ${currentTf} stopped`);
+  } else {
+    // Revert toggle if failed
+    el.checked = wasChecked;
+  }
+  renderCoins();
+}
+
+async function toggleMaster(el) {
+  const wasChecked = !el.checked;
+  const result = await sendToBot('/api/master', { enabled: el.checked, timeframe: currentTf });
+  
+  if (result && result.status === 'ok') {
+    const status = document.getElementById('masterStatus');
+    status.textContent = el.checked ? 'RUNNING' : 'STOPPED';
+    status.className = el.checked ? 'running' : '';
+    document.getElementById('statusDot').className = 'dot ' + (el.checked ? 'online' : '');
+    showToast(el.checked ? '🤖 Bot started' : '⏹ Bot stopped');
+  } else {
+    el.checked = wasChecked;
+  }
 }
 
 function toggleAllPause(el) {
-  coins.forEach(c => { activeCoins[c.id] = !el.checked; });
+  coins.forEach(c => { activeCoins[currentTf][c.id] = !el.checked; });
   renderCoins();
-  showToast(el.checked ? 'All markets paused' : 'All markets resumed');
+  showToast(el.checked ? `All ${currentTf} markets paused` : `All ${currentTf} markets resumed`);
 }
 
 function setTimeframe(tf, btn) {
   currentTf = tf;
   document.getElementById('currentTf').textContent = tf;
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => {
+    t.classList.remove('active');
+    t.style.borderColor = 'var(--border)';
+    t.style.color = 'var(--muted)';
+  });
   btn.classList.add('active');
+  btn.style.backgroundColor = tfColors[tf];
+  btn.style.borderColor = tfColors[tf];
+  btn.style.color = '#0d0b08';
+  
   renderCoins();
   showToast(`Timeframe set to ${tf}`);
 }
 
 function updateActiveCount() {
-  const count = Object.values(activeCoins).filter(Boolean).length;
+  const count = Object.values(activeCoins[currentTf]).filter(Boolean).length;
   document.getElementById('activeCount').textContent = `${count}/${coins.length}`;
 }
 
@@ -600,22 +671,26 @@ function updateCalculator() {
   document.querySelector('#calcSL').closest('.calc-row').querySelector('.calc-label').textContent = `At Stop Loss (${params.stopLoss}c)`;
 }
 
-function saveParams() {
-  sendToBot('/api/params', params);
-  showToast('✅ Parameters saved');
+async function saveParams() {
+  const result = await sendToBot('/api/params', params);
+  if (result) {
+    showToast('✅ Parameters saved');
+  }
 }
 
 let currentMarketUrl = null;
 let currentMarketId = null;
 
 function onUrlInput(val) {
-  if (!val.trim()) document.getElementById('marketPreview').style.display = 'none';
+  if (!val.trim()) {
+    document.getElementById('marketPreview').style.display = 'none';
+    document.getElementById('previewError').style.display = 'none';
+  }
 }
 
 async function loadMarket() {
   const url = document.getElementById('urlInput').value.trim();
   if (!url) { showToast('⚠ Please paste a Polymarket URL'); return; }
-  if (!url.includes('polymarket.com')) { showToast('⚠ Invalid Polymarket URL'); return; }
   currentMarketUrl = url;
   const preview = document.getElementById('marketPreview');
   preview.style.display = 'block';
@@ -626,15 +701,16 @@ async function loadMarket() {
   try {
     const res = await fetch(`/api/submarkets?url=${encodeURIComponent(url)}`);
     const data = await res.json();
-    if (data.markets && data.markets.length > 1) {
-      showSubmarkets(data.markets, data.event_title);
-    } else if (data.markets && data.markets.length === 1) {
-      showMarketPreview(data.markets[0], data.event_title);
+    if (data.markets && data.markets.length > 0) {
+      if (data.markets.length > 1) {
+        showSubmarkets(data.markets, data.event_title);
+      } else {
+        showMarketPreview(data.markets[0], data.event_title);
+      }
     } else {
       showMarketPreview(null, null);
     }
   } catch (e) {
-    console.error('loadMarket error:', e);
     document.getElementById('previewLoading').style.display = 'none';
     document.getElementById('previewError').style.display = 'flex';
   }
@@ -711,42 +787,74 @@ async function confirmSubmarkets() {
   if (selected.length === 0) { showToast('⚠ Select at least one market'); return; }
   for (const m of selected) {
     await sendToBot('/api/trade', { market_id: m.market_id, token_id: m.token_id, ...params });
+    // Update active state in UI
+    const coinId = m.slug.split('-')[0];
+    activeCoins[coinId] = true;
   }
+  renderCoins();
   showToast(`🚀 ${selected.length} market(s) automated!`);
   cancelPreview();
 }
 
 function confirmManualTrade() {
-  if (!currentMarketUrl) return;
-  sendToBot('/api/trade', { url: currentMarketUrl, market_id: currentMarketId, ...params });
+  if (!currentMarketId) return;
+  sendToBot('/api/trade', { market_id: currentMarketId, ...params });
+  // Try to derive coin ID from question or title to update UI
+  const title = document.getElementById('previewTitle').textContent.toLowerCase();
+  const coin = coins.find(c => title.includes(c.name.toLowerCase()));
+  if (coin) activeCoins[coin.id] = true;
+  
+  renderCoins();
   showToast('🚀 Market automated with saved parameters');
   cancelPreview();
 }
 
-function killAll() {
+async function killAll() {
   if (confirm('Kill all positions?')) {
-    Object.keys(activeCoins).forEach(k => activeCoins[k] = false);
-    renderCoins();
-    sendToBot('/api/kill', {});
-    showToast('🚨 Kill switch activated');
+    const result = await sendToBot('/api/kill', {});
+    if (result) {
+      Object.keys(activeCoins).forEach(tf => {
+        Object.keys(activeCoins[tf]).forEach(k => activeCoins[tf][k] = false);
+      });
+      renderCoins();
+      showToast('🚨 Kill switch activated');
+    }
   }
 }
 
 async function sendToBot(endpoint, data) {
   try {
-    await fetch(endpoint, {
+    const response = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
     });
-  } catch (e) {}
+    const result = await response.json();
+    if (!response.ok || result.error) {
+      showToast('❌ Error: ' + (result.error || response.statusText));
+      return null;
+    }
+    return result;
+  } catch (e) {
+    showToast('❌ Connection Error. Is the bot running?');
+    console.error(e);
+    return null;
+  }
 }
 
 async function fetchBalance() {
   try {
     const res = await fetch('/api/balance');
     const data = await res.json();
-    document.getElementById('balanceChip').textContent = `$${data.available.toFixed(2)}`;
+    // Update the top chip (USDC Balance)
+    const chip = document.getElementById('balanceChip');
+    if (chip) chip.textContent = `💰 $${data.usdc_balance.toFixed(2)}`;
+    
+    // Update the Portfolio Value in the master bar
+    const portfolioEl = document.getElementById('portfolioVal');
+    if (portfolioEl && data.total_portfolio) {
+      portfolioEl.textContent = `$${data.total_portfolio.toFixed(2)}`;
+    }
   } catch (e) {}
 }
 
@@ -773,8 +881,10 @@ function showToast(msg) {
 renderCoins();
 fetchBalance();
 fetchParams();
+fetchPrices();
 updateCalculator();
-setInterval(fetchBalance, 15000);
+setInterval(fetchBalance, 5000);
+setInterval(fetchPrices, 3000);
 </script>
 </body>
 </html>

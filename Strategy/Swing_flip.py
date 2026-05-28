@@ -40,6 +40,7 @@ class SwingFlip:
         self.stop_loss_price = None
         
         self.buy_buffer = 0.01       # 1 cent buffer
+        self.sell_buffer = 0.01      # 1 cent buffer for aggressive exits
         self.num_shares = float(MIN_SHARES) 
         self.cooldown_seconds = float(COOLDOWN_SECONDS)
         self.min_shares = float(MIN_SHARES)
@@ -47,6 +48,11 @@ class SwingFlip:
         self.entry_direction = None
         self.last_yes_price = None
         self.last_no_price = None
+        
+        # P&L Tracking
+        self.total_pnl = 0.0
+        self.last_pnl = 0.0
+        self.last_cost = 0.0
 
     def _round_price(self, price: float) -> float:
         """Round price to the market's tick size."""
@@ -59,6 +65,22 @@ class SwingFlip:
     def _round_shares(self, shares: float) -> float:
         """Round shares to 2 decimal places (standard for Polymarket)."""
         return round(float(shares), 2)
+
+    async def force_entry(self, direction: str):
+        """Forces an entry in a specific direction, bypassing threshold checks."""
+        if self.position is not None or self.is_placing_order:
+            return
+            
+        side = direction.upper()
+        price = self.last_yes_price if side == "YES" else self.last_no_price
+        if not price: price = 0.5 # Fallback
+        
+        buy_price = self._round_price(min(price + self.buy_buffer, 0.99))
+        size = float(self.pocket.calculate_size(buy_price, self.num_shares))
+        if size >= self.num_shares:
+            logger.info(f"[{self.market_id}] Forced entry signal received: {side}")
+            self.entry_direction = side
+            await self._buy(side, buy_price, size)
 
     async def on_price_update(self, yes_price: float):
         """
@@ -73,12 +95,14 @@ class SwingFlip:
         self.last_yes_price = yes_price
         self.last_no_price = no_price
   
+        # DEBUG: Log every price update during testing to see if strategy is active
         logger.debug(f"[{self.market_id}] Price Update: YES=${yes_price:.4f} | NO=${no_price:.4f}")
 
         if self.in_cooldown:
             return
 
         if self.position is None:
+            logger.info(f"[{self.market_id}] Monitoring for Entry: YES=${yes_price:.2f} (Target: ${self.entry_threshold:.2f})")
             await self._check_entry(yes_price, no_price)
         elif self.position == "YES":
             await self._manage_yes_position(yes_price)
@@ -86,15 +110,35 @@ class SwingFlip:
             await self._manage_no_position(no_price)
 
     async def _check_entry(self, yes_price: float, no_price: float):
+        # Calculate dynamic bounds for safety
+        def get_bounds(side, price):
+            if side == "YES":
+                tp = self.take_profit_price or (price + (price * self.take_profit_pct))
+                sl = self.stop_loss_price or (price - (price * self.stop_loss_pct))
+            else:
+                tp = self.take_profit_price or (price + (price * self.take_profit_pct))
+                sl = self.stop_loss_price or (price - (price * self.stop_loss_pct))
+            return tp, sl
+
         if yes_price >= self.entry_threshold:
-            buy_price = self._round_price(min(yes_price + self.buy_buffer, 0.99))
+            tp, sl = get_bounds("YES", yes_price)
+            buy_price = self._round_price(min(self.entry_threshold + self.buy_buffer, 0.99))
+            if buy_price >= (tp - 0.02):
+                logger.warning(f"[{self.market_id}] Skipping YES entry: Planned order {buy_price:.2f} too close to TP {tp:.2f}")
+                return
             size = float(self.pocket.calculate_size(buy_price, self.num_shares))
+            logger.info(f"[{self.market_id}] Threshold met for YES: {yes_price:.2f} >= {self.entry_threshold:.2f}. Placing limit at {buy_price:.2f}. Size: {size:.2f}/{self.num_shares:.2f}")
             if size >= self.num_shares:
                 self.entry_direction = "YES"
                 await self._buy("YES", buy_price, size)
         elif no_price >= self.entry_threshold:
-            buy_price = self._round_price(min(no_price + self.buy_buffer, 0.99))
+            tp, sl = get_bounds("NO", no_price)
+            buy_price = self._round_price(min(self.entry_threshold + self.buy_buffer, 0.99))
+            if buy_price >= (tp - 0.02):
+                logger.warning(f"[{self.market_id}] Skipping NO entry: Planned order {buy_price:.2f} too close to TP {tp:.2f}")
+                return
             size = float(self.pocket.calculate_size(buy_price, self.num_shares))
+            logger.info(f"[{self.market_id}] Threshold met for NO: {no_price:.2f} >= {self.entry_threshold:.2f}. Placing limit at {buy_price:.2f}. Size: {size:.2f}/{self.num_shares:.2f}")
             if size >= self.num_shares:
                 self.entry_direction = "NO"
                 await self._buy("NO", buy_price, size)
@@ -130,10 +174,13 @@ class SwingFlip:
                 # Pre-check: Can we afford the flip?
                 no_price = self._round_price(1 - yes_price)
                 buy_price = self._round_price(min(no_price + self.buy_buffer, 0.99))
-                size = float(self.pocket.calculate_size(buy_price, self.num_shares))
-                
-                if size < self.min_shares:
-                    logger.warning(f"[{self.market_id}] Cannot flip: Insufficient balance for NO entry. Aborting flip to keep current YES position.")
+
+                available = max(0.0, float(self.pocket.usdc_balance - self.pocket.reserved))
+                effective_available = available + (float(self.shares) * float(yes_price))
+                size = min(float(self.num_shares), float(effective_available) / (float(buy_price) * 1.005)) if buy_price > 0 else 0.0
+
+                if size < 5.0:
+                    logger.warning(f"[{self.market_id}] Cannot flip: Insufficient effective balance for NO entry (Need 5.0, have {size:.2f}).")
                     return
 
                 # 1. Exit current position
@@ -178,10 +225,13 @@ class SwingFlip:
                 # Pre-check: Can we afford the flip?
                 yes_price = self._round_price(1 - no_price)
                 buy_price = self._round_price(min(yes_price + self.buy_buffer, 0.99))
-                size = float(self.pocket.calculate_size(buy_price, self.num_shares))
-                
-                if size < self.min_shares:
-                    logger.warning(f"[{self.market_id}] Cannot flip: Insufficient balance for YES entry. Aborting flip to keep current NO position.")
+
+                available = max(0.0, float(self.pocket.usdc_balance - self.pocket.reserved))
+                effective_available = available + (float(self.shares) * float(no_price))
+                size = min(float(self.num_shares), float(effective_available) / (float(buy_price) * 1.005)) if buy_price > 0 else 0.0
+
+                if size < 5.0:
+                    logger.warning(f"[{self.market_id}] Cannot flip: Insufficient effective balance for YES entry (Need 5.0, have {size:.2f}).")
                     return
 
                 # 1. Exit current position
@@ -206,12 +256,16 @@ class SwingFlip:
         success = await self._sell(current_position, price)
         
         if success:
+            pnl_str = f"P&L: ${self.last_pnl:+.2f}"
+            logger.info(f"[{self.market_id}] Trade Finished | {pnl_str} | Total: ${self.total_pnl:+.2f}")
+            
             if self.notify:
                 await self.notify(
                     f"🏁 Position Closed\n"
                     f"Reason: {reason}\n"
                     f"Side: {current_position}\n"
-                    f"Price: {price:.2f}"
+                    f"Price: {price:.2f}\n"
+                    f"{pnl_str}"
                 )
             
             if self.auto_redeem:
@@ -243,7 +297,7 @@ class SwingFlip:
 
         size = self._round_shares(size)
         usd_amount = price * size
-        logger.info(f"[{self.market_id}] BUY {side} | Price: {price:.4f} | Target Shares: {size:.2f} | USD: ${usd_amount:.2f}")
+        logger.info(f"[{self.market_id}] 🚀 ATTEMPTING BUY: {side} | Price: {price:.4f} | Shares: {size:.2f} | Total: ${usd_amount:.2f}")
 
         # Reserve balance in pocket
         self.pocket.reserve(usd_amount)
@@ -254,6 +308,9 @@ class SwingFlip:
             client_v2 = self.pocket.get_client_v2()
             if client_v2:
                 from py_clob_client_v2.clob_types import PartialCreateOrderOptions, OrderType
+                
+                logger.info(f"[{self.market_id}] Sending signed order to Polymarket for {side}...")
+                
                 order_args = OrderArgs(
                     token_id=token_id,
                     price=float(price),
@@ -266,18 +323,47 @@ class SwingFlip:
                 resp = await asyncio.to_thread(client_v2.post_order, signed_order, OrderType.GTC)
                 
                 if resp.get("success"):
-                    logger.info(f"[{self.market_id}] Buy Order matched: {resp.get('orderID')}")
+                    order_id = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+                    if not order_id:
+                        logger.error(f"[{self.market_id}] Buy accepted but missing order id: {resp}")
+                        self.pocket.release(usd_amount)
+                        return False
+
+                    matched = 0.0
+                    for _ in range(5):
+                        order = await asyncio.to_thread(client_v2.get_order, order_id)
+                        matched = float(order.get("size_matched", 0) or 0)
+                        if matched > 0:
+                            break
+                        await asyncio.sleep(1.0)
+
+                    try:
+                        from py_clob_client_v2.clob_types import OrderPayload
+                        await asyncio.to_thread(client_v2.cancel_order, OrderPayload(orderID=order_id))
+                    except Exception:
+                        pass
+
+                    if matched <= 0:
+                        self.pocket.release(usd_amount)
+                        return False
+
+                    filled_cost = float(price) * matched
+                    if usd_amount > filled_cost:
+                        self.pocket.release(usd_amount - filled_cost)
+
+                    logger.info(f"[{self.market_id}] Buy filled: {order_id} | Shares: {matched:.2f} @ {price:.4f}")
                     self.position = side
-                    self.shares = float(size)
+                    self.shares = float(matched)
                     self.entry_price = float(price)
+                    self.last_cost = float(filled_cost)
                     self.trade_count += 1
                     if self.notify:
                         await self.notify(
                             f"✅ Entry Executed\n"
                             f"Side: {side}\n"
                             f"Price: {price:.2f}\n"
-                            f"Shares: {size:.2f}\n"
-                            f"Cost: ${usd_amount:.2f}"
+                            f"Shares: {matched:.2f}\n"
+                            f"Cost: ${filled_cost:.2f}"
                         )
                     return True
                 else:
@@ -302,7 +388,16 @@ class SwingFlip:
             return False
 
         # Verify actual balance before selling to prevent failures
-        actual_shares = await self.pocket.get_token_balance(token_id)
+        # Retry up to 3 times with small delay to account for CLOB lag after buy
+        actual_shares = 0.0
+        for i in range(3):
+            actual_shares = await self.pocket.get_token_balance(token_id)
+            if actual_shares >= 0.01:
+                break
+            if i < 2:
+                logger.info(f"[{self.market_id}] Waiting for shares to reflect in wallet (Attempt {i+1})...")
+                await asyncio.sleep(1.5)
+
         if actual_shares < 0.01:
             logger.warning(f"[{self.market_id}] No actual shares found for {side} in wallet. Syncing state.")
             self.position = None
@@ -311,7 +406,11 @@ class SwingFlip:
             return True # Consider it "closed" if we have nothing
 
         shares_to_sell = self._round_shares(actual_shares)
-        logger.info(f"[{self.market_id}] SELL {side} | Price: {price:.4f} | Shares: {shares_to_sell:.2f} (Actual: {actual_shares})")
+        
+        # Use an aggressive sell price to ensure immediate execution (limit order that hits the book)
+        aggressive_price = self._round_price(max(0.01, price - self.sell_buffer))
+        
+        logger.info(f"[{self.market_id}] SELL {side} | Price: {aggressive_price:.4f} (Market: {price:.4f}) | Shares: {shares_to_sell:.2f}")
         
         outer_placing_state = self.is_placing_order
         self.is_placing_order = True
@@ -321,25 +420,54 @@ class SwingFlip:
                 from py_clob_client_v2.clob_types import PartialCreateOrderOptions, OrderType
                 order_args = OrderArgs(
                     token_id=token_id,
-                    price=float(price),
+                    price=float(aggressive_price),
                     size=float(shares_to_sell),
                     side=SELL,
                 )
                 options = PartialCreateOrderOptions(neg_risk=self.neg_risk)
                 
                 signed_order = await asyncio.to_thread(client_v2.create_order, order_args, options)
-                resp = await asyncio.to_thread(client_v2.post_order, signed_order, OrderType.GTC)
+                order_type = getattr(OrderType, "IOC", OrderType.GTC)
+                resp = await asyncio.to_thread(client_v2.post_order, signed_order, order_type)
                 
                 if resp.get("success"):
-                    logger.info(f"[{self.market_id}] Sell Order matched: {resp.get('orderID')}")
-                    # Release reservation
-                    usd_released = self.entry_price * self.shares if self.entry_price else 0
-                    self.pocket.release(usd_released)
+                    order_id = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+                    if not order_id:
+                        logger.error(f"[{self.market_id}] Sell accepted but missing order id: {resp}")
+                        return False
+
+                    order = await asyncio.to_thread(client_v2.get_order, order_id)
+                    matched = float(order.get("size_matched", 0) or 0)
+                    if matched <= 0:
+                        try:
+                            from py_clob_client_v2.clob_types import OrderPayload
+                            await asyncio.to_thread(client_v2.cancel_order, OrderPayload(orderID=order_id))
+                        except Exception:
+                            pass
+                        return False
                     
-                    self.position = None
-                    self.shares = 0.0
-                    self.entry_price = None
-                    return True
+                    # Calculate P&L
+                    cost_per_share = (float(self.last_cost) / float(self.shares)) if self.shares else float(self.entry_price or aggressive_price)
+                    cost_sold = cost_per_share * matched
+                    proceeds = float(aggressive_price) * matched
+                    pnl = proceeds - cost_sold
+                    self.last_pnl = pnl
+                    self.total_pnl += pnl
+                    
+                    # Release reservation
+                    self.pocket.release(cost_sold)
+
+                    remaining = max(0.0, float(actual_shares) - matched)
+                    if remaining < 0.01:
+                        self.position = None
+                        self.shares = 0.0
+                        self.entry_price = None
+                        self.last_cost = 0.0
+                        return True
+
+                    self.shares = remaining
+                    self.last_cost = cost_per_share * remaining
+                    return False
                 else:
                     logger.error(f"[{self.market_id}] Sell Order failed: {resp.get('errorMsg')}")
                     return False
@@ -374,4 +502,6 @@ class SwingFlip:
             "num_shares": self.num_shares,
             "last_yes_price": self.last_yes_price,
             "last_no_price": self.last_no_price,
+            "last_pnl": self.last_pnl,
+            "total_pnl": self.total_pnl,
         }

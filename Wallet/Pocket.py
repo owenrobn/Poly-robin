@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 import time
 from py_clob_client.client import ClobClient
@@ -54,6 +55,13 @@ class Pocket:
                 funder=PROXY_WALLET
             )
             
+            # TEST CONNECTIVITY IMMEDIATELY
+            try:
+                test_balance = self.client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+                logger.info(f"✅ Polymarket Connectivity Verified. Initial Balance: {test_balance.get('balance', '0')}")
+            except Exception as e:
+                logger.error(f"❌ Polymarket API Test Failed: {e}")
+            
             logger.info("Polymarket CLOB clients (v1 & v2) initialized successfully")
         except Exception as e:
             logger.error(f"CLOB client init failed: {e}")
@@ -77,7 +85,7 @@ class Pocket:
                 asset_type=AssetType.COLLATERAL
             )
             
-            result = self.client.get_balance_allowance(params=params)
+            result = await asyncio.to_thread(self.client.get_balance_allowance, params=params)
             raw = int(result.get("balance", 0))
             balance = float(raw / 1_000_000)
             
@@ -93,7 +101,7 @@ class Pocket:
                 asset_type=AssetType.CONDITIONAL,
                 token_id=token_id
             )
-            result = self.client.get_balance_allowance(params=params)
+            result = await asyncio.to_thread(self.client.get_balance_allowance, params=params)
             raw = int(result.get("balance", 0))
             # Conditional tokens use 6 decimals usually on Polymarket
             balance = float(raw / 1_000_000)
@@ -109,37 +117,20 @@ class Pocket:
             return False
         return True
 
-    def calculate_size(self, price: float, shares: float = 10) -> float:
-        """
-        Calculate safe trade size based on available balance and minimum limits.
-        """
-        from config import MIN_SHARES
-        available = float(self.usdc_balance - self.reserved)
-        
-        # Calculate max shares we can afford at this price
-        if price <= 0:
-            return 0.0
-            
-        # Add a small buffer for fees
-        cost_per_share = price * 1.005 
-        max_affordable = available / cost_per_share
-        
-        target_shares = min(float(shares), max_affordable)
-        min_limit = float(MIN_SHARES)
-        
-        if target_shares < min_limit:
-            logger.warning(f"Calculated size {target_shares:.2f} is below minimum {min_limit}")
-            return 0.0
-            
-        return round(target_shares, 2)
+    def calculate_size(self, price: float, target_shares: float) -> float:
+        available = max(0.0, self.usdc_balance - self.reserved)
+        if price <= 0: return 0.0
+        max_shares = available / (price * 1.005)  # 0.5% fee buffer
+        return min(target_shares, max_shares)
 
     def reserve(self, amount: float):
-        self.reserved += float(amount)
+        self.reserved = round(float(self.reserved + amount), 4)
         logger.info(f"Reserved ${amount:.2f}. Total: ${self.reserved:.2f}")
 
     def release(self, amount: float):
-        self.reserved = max(0.0, self.reserved - float(amount))
-        logger.info(f"Released ${amount:.2f}. Total: ${self.reserved:.2f}")
+        old = self.reserved
+        self.reserved = round(max(0.0, float(self.reserved - amount)), 4)
+        logger.info(f"Released ${amount:.2f}. Total: ${self.reserved:.2f} (Was: ${old:.2f})")
 
     def get_summary(self) -> dict:
         available = self.usdc_balance - self.reserved

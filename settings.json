@@ -1,0 +1,12 @@
+{
+    "entry": 70,
+    "flip": 60,
+    "tp": 95,
+    "stopLoss": 50,
+    "buffer": 2,
+    "shares": 5,
+    "maxTrades": 3,
+    "cooldown": 30,
+    "autoRedeem": true,
+    "master": null
+}
