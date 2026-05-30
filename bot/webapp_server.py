@@ -1,5 +1,7 @@
 import logging
 import asyncio
+import time
+from collections import deque
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,6 +9,46 @@ import uvicorn
 from settings import settings_manager
 
 logger = logging.getLogger(__name__)
+
+# #region debug-point single-trade-stall:web-setup
+import json as _dbg_json, urllib.request as _dbg_ur, time as _dbg_time
+_dbg_env_path = ".dbg/single-trade-stall.env"
+_dbg_url = "http://127.0.0.1:7777/event"
+_dbg_session = "single-trade-stall"
+try:
+    with open(_dbg_env_path, "r", encoding="utf-8") as _f:
+        _c = _f.read().splitlines()
+    for _line in _c:
+        if _line.startswith("DEBUG_SERVER_URL="):
+            _dbg_url = _line.split("=", 1)[1].strip() or _dbg_url
+        elif _line.startswith("DEBUG_SESSION_ID="):
+            _dbg_session = _line.split("=", 1)[1].strip() or _dbg_session
+except Exception:
+    pass
+
+def _dbg_emit(hypothesis_id: str, location: str, msg: str, data=None, run_id: str = "pre"):
+    try:
+        _payload = {
+            "sessionId": _dbg_session,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "msg": msg,
+            "data": data or {},
+            "ts": int(_dbg_time.time() * 1000),
+        }
+        _dbg_ur.urlopen(
+            _dbg_ur.Request(
+                _dbg_url,
+                data=_dbg_json.dumps(_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            ),
+            timeout=0.25,
+        ).read()
+    except Exception:
+        pass
+# #endregion
 
 app = FastAPI()
 
@@ -21,6 +63,28 @@ app.add_middleware(
 _pocket = None
 _risk = None
 _ingestion = None
+_pending_autostarts = {}
+_trade_events = deque(maxlen=250)
+_trade_events_lock = asyncio.Lock()
+_trade_event_id = 0
+
+
+async def _record_trade_event(market_id: str, message: str, level: str = "info"):
+    global _trade_event_id
+    mid = str(market_id or "")
+    msg = str(message or "")
+    async with _trade_events_lock:
+        _trade_event_id += 1
+        _trade_events.append(
+            {
+                "id": int(_trade_event_id),
+                "ts": float(time.time()),
+                "market_id": mid,
+                "level": str(level or "info"),
+                "message": msg,
+            }
+        )
+        return int(_trade_event_id)
 
 
 def start_server(pocket, risk, ingestion):
@@ -64,9 +128,197 @@ async def get_balance():
     return summary
 
 
+@app.get("/api/holdings")
+async def get_holdings(timeframe: str = "5m"):
+    client_v2 = _pocket.get_client_v2()
+    recent_trades = []
+    if client_v2:
+        try:
+            recent_trades = await asyncio.to_thread(client_v2.get_trades, None, True, None)
+        except Exception:
+            recent_trades = []
+
+    tokens_by_market = {}
+
+    for mid, tokens in _ingestion.active_markets.items():
+        meta = _ingestion.market_metadata.get(mid, {})
+        if timeframe and meta.get("timeframe") and meta.get("timeframe") != timeframe:
+            continue
+        yes_token = tokens.get("yes")
+        no_token = tokens.get("no")
+        if yes_token:
+            tokens_by_market.setdefault(mid, set()).add(str(yes_token))
+        if no_token:
+            tokens_by_market.setdefault(mid, set()).add(str(no_token))
+
+    for t in recent_trades:
+        mid = t.get("market")
+        token_id = t.get("asset_id")
+        if not mid or not token_id:
+            continue
+        tokens_by_market.setdefault(str(mid), set()).add(str(token_id))
+
+    rows = []
+    for mid, token_ids in tokens_by_market.items():
+        meta = _ingestion.market_metadata.get(mid, {})
+        yes_token = _ingestion.active_markets.get(mid, {}).get("yes") if mid in _ingestion.active_markets else None
+        no_token = _ingestion.active_markets.get(mid, {}).get("no") if mid in _ingestion.active_markets else None
+
+        nonzero = []
+        for token_id in token_ids:
+            bal = await _pocket.get_token_balance(token_id)
+            if bal >= 0.01:
+                nonzero.append((token_id, bal))
+
+        if not nonzero:
+            continue
+
+        rows.append(
+            {
+                "market_id": mid,
+                "coin": meta.get("coin"),
+                "question": meta.get("question"),
+                "last_price": meta.get("last_price"),
+                "yes_token": yes_token,
+                "no_token": no_token,
+                "tokens": [
+                    {"token_id": tid, "balance": round(float(b), 6)}
+                    for tid, b in sorted(nonzero, key=lambda x: -x[1])
+                ],
+            }
+        )
+
+    return {"holdings": rows}
+
+
+@app.post("/api/liquidate")
+async def liquidate(data: dict):
+    all_markets = bool(data.get("all", True))
+    market_id = data.get("market_id")
+    token_id = data.get("token_id")
+
+    if not all_markets and not market_id and not token_id:
+        return {"error": "Provide token_id, market_id, or set all=true"}
+
+    client_v2 = _pocket.get_client_v2()
+    if not client_v2:
+        return {"error": "CLOB client not ready"}
+
+    client_v1 = _pocket.get_client()
+
+    from py_clob_client_v2.clob_types import PartialCreateOrderOptions, OrderType, OrderArgs
+    from py_clob_client_v2.clob_types import OrderPayload
+    from py_clob_client_v2.order_builder.constants import SELL
+
+    targets = set()
+    if token_id:
+        targets.add((None, str(token_id)))
+    else:
+        if all_markets:
+            holdings = (await get_holdings(timeframe="")).get("holdings", [])
+            for row in holdings:
+                mid = row.get("market_id")
+                for t in row.get("tokens", []):
+                    tid = t.get("token_id")
+                    if tid:
+                        targets.add((mid, str(tid)))
+        else:
+            holdings = (await get_holdings(timeframe="")).get("holdings", [])
+            for row in holdings:
+                if row.get("market_id") != market_id:
+                    continue
+                mid = row.get("market_id")
+                for t in row.get("tokens", []):
+                    tid = t.get("token_id")
+                    if tid:
+                        targets.add((mid, str(tid)))
+
+    results = []
+    for mid, tid in sorted(list(targets), key=lambda x: (x[0] or "", x[1])):
+        bal = await _pocket.get_token_balance(tid)
+        if bal < 0.01:
+            continue
+
+        size = round(float(bal), 2)
+        if size < 0.01:
+            continue
+
+        order_args = OrderArgs(
+            token_id=tid,
+            price=0.01,
+            size=float(size),
+            side=SELL,
+        )
+        neg_risk = False
+        if mid and mid in _ingestion.market_metadata:
+            neg_risk = bool(_ingestion.market_metadata.get(mid, {}).get("neg_risk", False))
+        elif client_v1:
+            try:
+                neg_risk = bool(await asyncio.to_thread(client_v1.get_neg_risk, tid))
+            except Exception:
+                neg_risk = False
+
+        options = PartialCreateOrderOptions(neg_risk=neg_risk)
+        resp = {}
+        order_id = None
+        matched = 0.0
+        error = None
+        try:
+            signed_order = await asyncio.to_thread(client_v2.create_order, order_args, options)
+            order_type = getattr(OrderType, "IOC", OrderType.GTC)
+            resp = await asyncio.to_thread(client_v2.post_order, signed_order, order_type)
+
+            order_id = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+            if resp.get("success") and order_id:
+                try:
+                    order = await asyncio.to_thread(client_v2.get_order, order_id)
+                    matched = float(order.get("size_matched", 0) or 0)
+                    await asyncio.to_thread(client_v2.cancel_order, OrderPayload(orderID=order_id))
+                except Exception:
+                    pass
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+
+        results.append(
+            {
+                "market_id": mid,
+                "token_id": tid,
+                "balance": round(float(bal), 6),
+                "attempted": float(size),
+                "success": bool(resp.get("success")),
+                "order_id": order_id,
+                "matched": round(float(matched), 6),
+                "neg_risk": bool(neg_risk),
+                "error": error,
+            }
+        )
+
+    await _pocket.refresh_balances(force=True)
+    return {"status": "ok", "results": results, "balance": _pocket.get_summary()}
+
+
 @app.get("/api/status")
 async def get_status():
     return _risk.get_status()
+
+@app.get("/api/trade-events")
+async def get_trade_events(after: int = 0, limit: int = 100):
+    try:
+        after_id = int(after or 0)
+    except Exception:
+        after_id = 0
+    try:
+        lim = int(limit or 100)
+    except Exception:
+        lim = 100
+    lim = max(1, min(200, lim))
+
+    async with _trade_events_lock:
+        latest_id = int(_trade_event_id)
+        events = [e for e in list(_trade_events) if int(e.get("id", 0) or 0) > after_id]
+    if len(events) > lim:
+        events = events[-lim:]
+    return {"events": events, "latest_id": latest_id}
 
 
 @app.post("/api/master")
@@ -92,14 +344,48 @@ async def coin_toggle(data: dict):
     enabled = data.get("enabled")
     timeframe = data.get("timeframe", "5m")
     logger.info(f"UI coin-toggle: {coin} {timeframe} -> {'ON' if enabled else 'OFF'}")
+    _dbg_emit("E", "bot/webapp_server.py:coin_toggle", "[DEBUG] coin-toggle", {"coin": coin, "enabled": bool(enabled), "timeframe": timeframe})
+
+    param_keys = {"entry", "flip", "tp", "stopLoss", "buffer", "shares", "maxTrades", "cooldown", "autoRedeem"}
+    to_save = {k: data[k] for k in param_keys if k in data}
+    if to_save:
+        settings_manager.save(to_save)
+
     if enabled:
         market_id, token_id = await _ingestion.add_coin_market(coin, timeframe)
         if not market_id:
+            _dbg_emit("D", "bot/webapp_server.py:coin_toggle", "[DEBUG] add-coin-market failed", {"coin": coin, "timeframe": timeframe})
             return {
                 "error": f"Could not find active {coin.upper()} {timeframe} market"
             }
-        trade_resp = await start_trade({"market_id": market_id})
+
+        meta = _ingestion.market_metadata.get(market_id, {})
+        window_end_ts = meta.get("window_end_ts")
+        if window_end_ts and time.time() >= (float(window_end_ts) - 45.0):
+            _ingestion.remove_coin_market(coin, timeframe)
+            key = f"{coin}:{timeframe}"
+            if key not in _pending_autostarts or _pending_autostarts.get(key) is None or _pending_autostarts[key].done():
+                async def _autostart():
+                    deadline = time.time() + 120.0
+                    while time.time() < deadline:
+                        mid, _ = await _ingestion.add_coin_market(coin, timeframe)
+                        if mid:
+                            m = _ingestion.market_metadata.get(mid, {})
+                            end_ts = m.get("window_end_ts")
+                            if end_ts and time.time() >= (float(end_ts) - 45.0):
+                                await asyncio.sleep(2.0)
+                                continue
+                            await _record_trade_event(mid, f"{coin.upper()} {timeframe} auto-started on new market window")
+                            await start_trade({"market_id": mid, **to_save})
+                            return
+                        await asyncio.sleep(2.0)
+                _pending_autostarts[key] = asyncio.create_task(_autostart())
+            await _record_trade_event(market_id, f"{coin.upper()} {timeframe} near expiry. Queued for next market window.")
+            return {"status": "ok", "coin": coin, "enabled": True, "pending": True, "message": f"{coin.upper()} {timeframe} near expiry. Queued for next market."}
+
+        trade_resp = await start_trade({"market_id": market_id, **to_save})
         if trade_resp.get("error"):
+            _dbg_emit("A", "bot/webapp_server.py:coin_toggle", "[DEBUG] trade-start error", {"coin": coin, "market_id": market_id, "error": trade_resp.get("error")})
             return {"error": trade_resp["error"]}
         return {
             "status": "ok",
@@ -110,6 +396,7 @@ async def coin_toggle(data: dict):
         }
     else:
         _ingestion.remove_coin_market(coin, timeframe)
+        await _record_trade_event("", f"{coin.upper()} {timeframe} stopped")
         return {"status": "ok", "coin": coin, "enabled": False}
 
 
@@ -147,14 +434,17 @@ def apply_settings(swing, data=None):
 async def start_trade(data: dict):
     from strategy.swing_flip import SwingFlip
     market_id = data.get("market_id")
+    _dbg_emit("E", "bot/webapp_server.py:start_trade", "[DEBUG] trade-request", {"market_id": market_id, "has_url": bool(data.get("url")), "profile": settings_manager.get_active_profile()})
     if not market_id:
         url = data.get("url")
         market_id, token_id = await _ingestion.add_market_from_url(url)
     
     if not market_id:
+        _dbg_emit("D", "bot/webapp_server.py:start_trade", "[DEBUG] resolve-market failed", {})
         return {"error": "Could not resolve market"}
         
     if not _risk.can_open_trade(market_id):
+        _dbg_emit("A", "bot/webapp_server.py:start_trade", "[DEBUG] blocked-by-risk", {"market_id": market_id})
         return {"error": "Trade blocked by risk controls"}
     
     tokens = _ingestion.active_markets.get(market_id, {})
@@ -170,20 +460,40 @@ async def start_trade(data: dict):
 
     meta = _ingestion.market_metadata.get(market_id, {})
     tick_size = meta.get("tick_size", 0.01)
+
+    async def _ui_notify(message: str):
+        await _record_trade_event(market_id, message)
+
     swing = SwingFlip(
         market_id=market_id,
         tokens=tokens,
         pocket=_pocket,
-        notify=None,
+        notify=_ui_notify,
         on_done=_risk.close_trade_async,
         tick_size=tick_size,
-        neg_risk=meta.get("neg_risk", False)
+        neg_risk=meta.get("neg_risk", False),
+        window_end_ts=meta.get("window_end_ts"),
     )
     
     # Apply settings (merging any one-off overrides from the UI)
     apply_settings(swing, data)
+    _dbg_emit(
+        "E",
+        "bot/webapp_server.py:start_trade",
+        "[DEBUG] trade-created",
+        {
+            "market_id": market_id,
+            "entry": float(swing.entry_threshold),
+            "tp": float(swing.take_profit_price) if swing.take_profit_price is not None else None,
+            "sl": float(swing.stop_loss_price) if swing.stop_loss_price is not None else None,
+            "flip": float(swing.flip_threshold),
+            "buffer": float(swing.buy_buffer),
+            "shares": float(swing.num_shares),
+        },
+    )
     
     _risk.register_trade(market_id, swing)
+    await _record_trade_event(market_id, "Trade started (watching for entry)")
     return {"status": "started", "market_id": market_id}
 
 
@@ -233,16 +543,34 @@ async def ping_trade(data: dict):
 
 @app.get("/api/params")
 async def get_params():
-    return settings_manager.get_all()
+    s = settings_manager.get_all()
+    param_keys = {"entry", "flip", "tp", "stopLoss", "buffer", "shares", "maxTrades", "cooldown", "autoRedeem", "master"}
+    return {k: s.get(k) for k in param_keys if k in s}
+
+@app.get("/api/profile")
+async def get_profile():
+    return {"active_profile": settings_manager.get_active_profile()}
+
+@app.post("/api/profile")
+async def set_profile(data: dict):
+    profile = data.get("profile")
+    settings_manager.set_active_profile(profile)
+    for swing in _risk.active_trades.values():
+        apply_settings(swing)
+        logger.info(f"[{swing.market_id}] Profile switched -> {settings_manager.get_active_profile()}")
+    return {"status": "ok", "active_profile": settings_manager.get_active_profile(), "params": settings_manager.get_all()}
 
 @app.post("/api/params")
 async def save_params(data: dict):
-    settings_manager.save(data)
+    param_keys = {"entry", "flip", "tp", "stopLoss", "buffer", "shares", "maxTrades", "cooldown", "autoRedeem", "master"}
+    filtered = {k: data[k] for k in param_keys if k in data}
+    if filtered:
+        settings_manager.save(filtered)
     # Update ALL active trades immediately, even those currently in a position
     for swing in _risk.active_trades.values():
         apply_settings(swing)
         logger.info(f"[{swing.market_id}] Settings synchronized live: Entry={swing.entry_threshold:.2f}, TP={swing.take_profit_price:.2f}")
-    return {"status": "saved", "params": settings_manager.get_all()}
+    return {"status": "saved", "params": await get_params()}
 
 
 @app.post("/api/kill")

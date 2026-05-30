@@ -122,7 +122,8 @@ class PolyRobinBot:
             notify=self.send_alert,
             on_done=self.risk.close_trade_async,
             tick_size=tick_size,
-            neg_risk=meta.get("neg_risk", False)
+            neg_risk=meta.get("neg_risk", False),
+            window_end_ts=meta.get("window_end_ts"),
         )
         self._configure_swing(swing, overrides)
         self.risk.register_trade(market_id, swing)
@@ -259,7 +260,8 @@ class PolyRobinBot:
                 notify=self.send_alert,
                 on_done=self.risk.close_trade_async,
                 tick_size=tick_size,
-                neg_risk=meta.get("neg_risk", False)
+                neg_risk=meta.get("neg_risk", False),
+                window_end_ts=meta.get("window_end_ts"),
             )
             self._configure_swing(swing)
             self.risk.register_trade(market_id, swing)

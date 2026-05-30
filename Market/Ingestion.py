@@ -8,6 +8,8 @@ from config import CLOB_API_URL
 
 logger = logging.getLogger(__name__)
 
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=3)
+
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 COIN_SLUGS = {
@@ -72,7 +74,7 @@ class MarketIngestion:
         logger.info(f"Searching for active {name} via Gamma Query...")
         
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                 query_url = f"https://gamma-api.polymarket.com/markets?query={search_query}&active=true&closed=false&limit=10"
                 async with session.get(query_url, headers=BROWSER_HEADERS) as resp:
                     if resp.status == 200:
@@ -108,8 +110,8 @@ class MarketIngestion:
                             if isinstance(clob_ids, str):
                                 clob_ids = json.loads(clob_ids)
                             
-                            yes_token = clob_ids[0] if len(clob_ids) > 0 else None
-                            no_token = clob_ids[1] if len(clob_ids) > 1 else None
+                            yes_token = str(clob_ids[0]) if len(clob_ids) > 0 and clob_ids[0] is not None else None
+                            no_token = str(clob_ids[1]) if len(clob_ids) > 1 and clob_ids[1] is not None else None
                             
                             if condition_id and yes_token:
                                 logger.info(f"✅ Resolved: {market.get('question')} → {condition_id}")
@@ -118,7 +120,7 @@ class MarketIngestion:
             slug = COIN_SLUGS.get(coin.lower())
             if slug:
                 logger.info(f"Fallback: Searching via Event Slug: {slug}...")
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                     gamma_url = f"https://gamma-api.polymarket.com/events?slug={slug}&active=true"
                     async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
                         if resp.status == 200:
@@ -140,8 +142,8 @@ class MarketIngestion:
                                         neg_risk = m.get("negRisk", False)
                                         
                                         if clob_ids:
-                                            yes_token = clob_ids[0] if len(clob_ids) > 0 else None
-                                            no_token = clob_ids[1] if len(clob_ids) > 1 else None
+                                            yes_token = str(clob_ids[0]) if len(clob_ids) > 0 and clob_ids[0] is not None else None
+                                            no_token = str(clob_ids[1]) if len(clob_ids) > 1 and clob_ids[1] is not None else None
                                             logger.info(f"✅ Resolved via Event: {m.get('question')} → {m.get('conditionId')} (Tick: {tick_size})")
                                             return m.get("conditionId"), {"yes": yes_token, "no": no_token}, tick_size, neg_risk
 
@@ -167,7 +169,7 @@ class MarketIngestion:
         if condition_id and tokens:
             # We already have a resolved one, let's get its details
             gamma_url = f"https://gamma-api.polymarket.com/markets?conditionId={condition_id}"
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                 async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -187,16 +189,44 @@ class MarketIngestion:
         return results
 
     async def add_coin_market(self, coin: str, timeframe: str):
-        market_id, tokens, tick_size, neg_risk = await self.resolve_active_contract(coin, timeframe)
+        for mid, meta in list(self.market_metadata.items()):
+            if meta.get("coin") == coin and meta.get("timeframe") == timeframe and mid in self.active_markets:
+                return mid, self.active_markets.get(mid)
+
+        import time
+        tf_map = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+        seconds = tf_map.get(timeframe.lower(), 300)
+        now = int(time.time())
+        window_ts = now - (now % seconds)
+        window_end_ts = window_ts + seconds
+        try:
+            market_id, tokens, tick_size, neg_risk = await asyncio.wait_for(
+                self.resolve_active_contract(coin, timeframe),
+                timeout=8,
+            )
+        except Exception:
+            market_id, tokens, tick_size, neg_risk = None, None, 0.01, False
         if market_id and tokens:
             self.active_markets[market_id] = tokens
             self.market_metadata[market_id] = {
                 "coin": coin,
                 "timeframe": timeframe,
                 "tick_size": tick_size,
-                "neg_risk": neg_risk
+                "neg_risk": neg_risk,
+                "window_start_ts": int(window_ts),
+                "window_end_ts": int(window_end_ts),
             }
             logger.info(f"Added {coin.upper()} {timeframe} → {market_id}")
+            yes_token = tokens.get("yes")
+            if yes_token and self.clob_client:
+                try:
+                    price_data = await asyncio.to_thread(self.clob_client.get_price, str(yes_token))
+                    current_price = float(price_data.get("price", 0) or 0)
+                    if current_price > 0:
+                        self.market_metadata[market_id]["last_price"] = current_price
+                        asyncio.create_task(self.on_price_update(market_id, current_price))
+                except Exception:
+                    pass
             return market_id, tokens
         else:
             key = (coin.lower(), timeframe.lower())
@@ -220,9 +250,15 @@ class MarketIngestion:
     async def _poll_for_market(self, coin: str, timeframe: str, interval: int = 10):
         key = (coin.lower(), timeframe.lower())
         logger.info(f"Polling for {coin.upper()} {timeframe} market every {interval}s...")
+        import time
+        tf_map = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+        seconds = tf_map.get(timeframe.lower(), 300)
         try:
             while self.running:
                 await asyncio.sleep(interval)
+                now = int(time.time())
+                window_ts = now - (now % seconds)
+                window_end_ts = window_ts + seconds
                 market_id, tokens, tick_size, neg_risk = await self.resolve_active_contract(coin, timeframe)
                 if market_id and tokens:
                     if market_id not in self.active_markets:
@@ -231,7 +267,9 @@ class MarketIngestion:
                             "coin": coin,
                             "timeframe": timeframe,
                             "tick_size": tick_size,
-                            "neg_risk": neg_risk
+                            "neg_risk": neg_risk,
+                            "window_start_ts": int(window_ts),
+                            "window_end_ts": int(window_end_ts),
                         }
                         logger.info(f"✅ Market opened! Auto-added {coin.upper()} {timeframe} → {market_id}")
                     break
@@ -246,7 +284,7 @@ class MarketIngestion:
             expired = []
             for market_id, meta in list(self.market_metadata.items()):
                 try:
-                    async with aiohttp.ClientSession() as session:
+                    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                         url = f"https://gamma-api.polymarket.com/markets?conditionId={market_id}"
                         async with session.get(url, headers=BROWSER_HEADERS) as resp:
                             if resp.status == 200:
@@ -347,7 +385,7 @@ class MarketIngestion:
     async def _resolve_token_id_with_tick(self, slug: str):
         gamma_url = f"https://gamma-api.polymarket.com/markets?slug={slug}&active=true"
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                 async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -363,15 +401,15 @@ class MarketIngestion:
                             if isinstance(clob_ids, str):
                                 clob_ids = json.loads(clob_ids)
                             
-                            yes_token = clob_ids[0] if len(clob_ids) > 0 else None
-                            no_token = clob_ids[1] if len(clob_ids) > 1 else None
+                            yes_token = str(clob_ids[0]) if len(clob_ids) > 0 and clob_ids[0] is not None else None
+                            no_token = str(clob_ids[1]) if len(clob_ids) > 1 and clob_ids[1] is not None else None
                             tokens = {"yes": yes_token, "no": no_token}
                             
                             tick_size = float(market.get("minimumTickSize", 0.01))
                             if yes_token and condition_id:
                                 if self.clob_client:
                                     try:
-                                        price_data = self.clob_client.get_price(yes_token)
+                                        price_data = self.clob_client.get_price(str(yes_token))
                                         current_price = float(price_data.get("price", 0))
                                         if current_price > 0:
                                             asyncio.create_task(self.on_price_update(condition_id, current_price))
@@ -382,7 +420,7 @@ class MarketIngestion:
 
         clob_url = f"{CLOB_API_URL}/markets/{slug}"
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                 async with session.get(clob_url, headers=BROWSER_HEADERS) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -392,6 +430,8 @@ class MarketIngestion:
                             tick_size = float(data.get("minimum_tick_size", 0.01))
                             yes_token = next((t.get("token_id") for t in clob_tokens if t.get("outcome") == "Yes"), None)
                             no_token = next((t.get("token_id") for t in clob_tokens if t.get("outcome") == "No"), None)
+                            yes_token = str(yes_token) if yes_token is not None else None
+                            no_token = str(no_token) if no_token is not None else None
                             return condition_id, {"yes": yes_token, "no": no_token}, tick_size
         except Exception as e:
             logger.error(f"CLOB slug resolution failed: {e}")
@@ -415,7 +455,7 @@ class MarketIngestion:
             
             logger.info(f"Fetching sub-markets for slug: {slug}")
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                 # 1. Try Gamma Event API
                 gamma_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
                 async with session.get(gamma_url, headers=BROWSER_HEADERS) as resp:
@@ -479,8 +519,9 @@ class MarketIngestion:
         tf_map = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
         seconds = tf_map.get(timeframe.lower(), 300)
         window_ts = now - (now % seconds) 
+        window_end_ts = window_ts + seconds
         
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
             for coin, base_slug in COIN_SLUGS.items():
                 deterministic_slug = f"{coin}-updown-{timeframe.lower()}-{window_ts}"
                 url = f"https://gamma-api.polymarket.com/events?slug={deterministic_slug}"
@@ -513,8 +554,8 @@ class MarketIngestion:
                                 
                                 if market_id and token_ids and len(token_ids) >= 2:
                                     self.active_markets[market_id] = {
-                                        "yes": token_ids[0],
-                                        "no": token_ids[1]
+                                        "yes": str(token_ids[0]),
+                                        "no": str(token_ids[1])
                                     }
                                     
                                     # Fetch current price immediately for UI
@@ -527,7 +568,9 @@ class MarketIngestion:
                                         "neg_risk": market.get("negRisk", False),
                                         "question": market.get("question"),
                                         "last_price": last_price,
-                                        "timeframe": timeframe
+                                        "timeframe": timeframe,
+                                        "window_start_ts": int(window_ts),
+                                        "window_end_ts": int(window_end_ts),
                                     }
                                     logger.info(f"🔍 MARKET DISCOVERED ({coin.upper()}): {market.get('question')} at ${last_price:.4f}")
                                     # We do NOT trigger trades here. User must toggle them in UI.
@@ -578,11 +621,12 @@ class MarketIngestion:
             logger.error(f"Message parse error: {e}")
 
     def _resolve_market_and_side(self, token_id: str):
+        token_id = str(token_id) if token_id is not None else ""
         for market_id, tokens in self.active_markets.items():
             if isinstance(tokens, dict):
-                if tokens.get("yes") == token_id:
+                if str(tokens.get("yes")) == token_id:
                     return market_id, "yes"
-                if tokens.get("no") == token_id:
+                if str(tokens.get("no")) == token_id:
                     return market_id, "no"
             elif tokens == token_id:
                 return market_id, "yes"

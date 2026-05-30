@@ -1,12 +1,30 @@
 {
-    "entry": 70,
-    "flip": 60,
-    "tp": 95,
-    "stopLoss": 50,
-    "buffer": 2,
-    "shares": 5,
-    "maxTrades": 3,
-    "cooldown": 30,
-    "autoRedeem": true,
-    "master": null
+    "active_profile": "personal",
+    "profiles": {
+        "personal": {
+            "entry": 55,
+            "flip": 55,
+            "tp": 95,
+            "stopLoss": 50,
+            "buffer": 2,
+            "shares": 5,
+            "maxTrades": 2,
+            "cooldown": 20,
+            "autoRedeem": true,
+            "master": null,
+            "market_id": "0x533edf17adf3291ce07708c024c384901cb529130b00c387cb186b1c99c1ecad"
+        },
+        "general": {
+            "entry": 70,
+            "flip": 60,
+            "tp": 95,
+            "stopLoss": 45,
+            "buffer": 2,
+            "shares": 10,
+            "maxTrades": 3,
+            "cooldown": 30,
+            "autoRedeem": true,
+            "master": false
+        }
+    }
 }

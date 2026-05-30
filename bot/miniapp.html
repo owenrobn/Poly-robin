@@ -60,6 +60,19 @@
     font-family: 'Share Tech Mono', monospace; font-size: 12px;
     color: var(--green); text-shadow: 0 0 8px rgba(57, 255, 110, 0.5);
   }
+  .profile-chip {
+    background: var(--surface2); border: 1px solid rgba(57, 255, 110, 0.2);
+    border-radius: 20px; padding: 2px 10px;
+    display: flex; align-items: center;
+    font-family: 'Share Tech Mono', monospace; font-size: 12px;
+  }
+  .profile-select {
+    background: transparent; border: none; outline: none;
+    color: var(--text);
+    font-family: 'Share Tech Mono', monospace; font-size: 12px; font-weight: 700;
+    cursor: pointer;
+  }
+  .profile-select option { background: var(--surface); color: var(--text); }
 
   .master-bar { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; background: var(--surface2); border-bottom: 1px solid var(--border); }
   .master-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); }
@@ -148,6 +161,12 @@
   .kill-btn { margin: 0 16px 16px; width: calc(100% - 32px); background: rgba(255, 77, 106, 0.1); border: 1px solid rgba(255, 77, 106, 0.3); border-radius: 8px; padding: 11px; font-size: 12px; font-weight: 700; color: var(--red); cursor: pointer; font-family: 'Share Tech Mono', monospace; text-transform: uppercase; letter-spacing: 0.08em; transition: all 0.2s; }
   .kill-btn:hover { background: rgba(255, 77, 106, 0.2); border-color: var(--red); }
 
+  .activity-card { margin: 0 16px 12px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+  .activity-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); margin-bottom: 8px; }
+  .activity-list { max-height: 180px; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface2); padding: 8px; }
+  .activity-item { font-family: 'Share Tech Mono', monospace; font-size: 11px; line-height: 1.35; color: var(--text); padding: 6px 6px; border-bottom: 1px solid rgba(42, 32, 24, 0.7); }
+  .activity-item:last-child { border-bottom: none; }
+
   /* MARKET PREVIEW */
   .market-preview { margin: 0 16px 12px; background: var(--card-bg); border: 1px solid var(--accent); border-radius: 12px; overflow: hidden; animation: slideDown 0.25s ease; }
   @keyframes slideDown { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
@@ -218,6 +237,12 @@
     </div>
   </div>
   <div class="header-right">
+    <div class="profile-chip">
+      <select class="profile-select" id="profileSelect" onchange="handleProfileChange(this.value)">
+        <option value="personal">personal</option>
+        <option value="general">general</option>
+      </select>
+    </div>
     <div class="balance-chip" id="balanceChip" onclick="fetchBalance()">💰 $0.00</div>
   </div>
 </div>
@@ -261,6 +286,12 @@
 
 <!-- COIN GRID -->
 <div class="coin-grid" id="coinGrid"></div>
+
+<div class="section-divider">Activity</div>
+<div class="activity-card">
+  <div class="activity-title">Trade Events</div>
+  <div class="activity-list" id="activityList"></div>
+</div>
 
 <!-- URL SECTION -->
 <div class="section-divider">Manual Market</div>
@@ -473,6 +504,7 @@ const coins = [
 let activeCoins = { '5m': {}, '15m': {}, '1h': {}, '4h': {} };
 let currentTf = '5m';
 let params = { entry: 70, flip: 60, tp: 95, stopLoss: 45, buffer: 2, shares: 10, maxTrades: 3, cooldown: 30 };
+let activeProfile = 'personal';
 
 const tfColors = { '5m': '#39ff6e', '15m': '#39e6ff', '1h': '#3988ff', '4h': '#a639ff' };
 
@@ -550,7 +582,7 @@ async function fetchPrices() {
 
 async function toggleCoin(id, el) {
   const wasChecked = !el.checked;
-  const result = await sendToBot('/api/coin-toggle', { coin: id, enabled: el.checked, timeframe: currentTf });
+  const result = await sendToBot('/api/coin-toggle', { coin: id, enabled: el.checked, timeframe: currentTf, ...params });
   
   if (result && result.status === 'ok') {
     activeCoins[currentTf][id] = el.checked;
@@ -618,6 +650,32 @@ async function fetchParams() {
     });
     updateCalculator();
   } catch (e) {}
+}
+
+async function fetchProfile() {
+  try {
+    const res = await fetch('/api/profile');
+    const data = await res.json();
+    const profile = (data && data.active_profile) ? String(data.active_profile) : 'personal';
+    activeProfile = profile;
+    const select = document.getElementById('profileSelect');
+    if (select) select.value = activeProfile;
+  } catch (e) {}
+}
+
+async function handleProfileChange(profile) {
+  const next = String(profile || '').trim().toLowerCase();
+  if (!next || next === activeProfile) return;
+  const prev = activeProfile;
+  const result = await sendToBot('/api/profile', { profile: next });
+  if (!result) {
+    const select = document.getElementById('profileSelect');
+    if (select) select.value = prev;
+    return;
+  }
+  activeProfile = next;
+  await fetchParams();
+  showToast(`Profile: ${activeProfile}`);
 }
 
 function updateParam(key, value, shouldSave = true) {
@@ -870,6 +928,44 @@ async function claimNow() {
   showToast('✅ Profits claimed!');
 }
 
+let lastTradeEventId = 0;
+
+function appendTradeEvent(ev) {
+  const list = document.getElementById('activityList');
+  if (!list) return;
+  const ts = ev && ev.ts ? new Date(ev.ts * 1000).toLocaleTimeString() : '';
+  const mid = ev && ev.market_id ? String(ev.market_id).slice(0, 10) : '';
+  const msg = String((ev && ev.message) ? ev.message : '').replace(/\s+/g, ' ').trim();
+  if (!msg) return;
+
+  const row = document.createElement('div');
+  row.className = 'activity-item';
+  row.textContent = `${ts} ${mid} ${msg}`.trim();
+  list.appendChild(row);
+  while (list.children.length > 60) list.removeChild(list.firstChild);
+  list.scrollTop = list.scrollHeight;
+
+  if (msg.includes('Trade Finished') || msg.includes('P&L') || msg.includes('Entry Executed')) {
+    showToast(msg);
+  }
+}
+
+async function fetchTradeEvents() {
+  try {
+    const res = await fetch(`/api/trade-events?after=${lastTradeEventId}&limit=50`);
+    const data = await res.json();
+    const events = (data && data.events) ? data.events : [];
+    if (events.length) {
+      events.forEach(e => {
+        appendTradeEvent(e);
+        if (e && typeof e.id === 'number' && e.id > lastTradeEventId) lastTradeEventId = e.id;
+      });
+    } else if (data && typeof data.latest_id === 'number' && data.latest_id > lastTradeEventId) {
+      lastTradeEventId = data.latest_id;
+    }
+  } catch (e) {}
+}
+
 function showToast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -880,11 +976,14 @@ function showToast(msg) {
 // Init
 renderCoins();
 fetchBalance();
+fetchProfile();
 fetchParams();
 fetchPrices();
+fetchTradeEvents();
 updateCalculator();
 setInterval(fetchBalance, 5000);
 setInterval(fetchPrices, 3000);
+setInterval(fetchTradeEvents, 1500);
 </script>
 </body>
 </html>
